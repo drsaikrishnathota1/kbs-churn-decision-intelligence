@@ -84,6 +84,28 @@ BUSINESS_ONLY_COLUMNS = ["CLTV"]
 # Excluded from the primary model; retained only for post-hoc auditing.
 AUDIT_ONLY_COLUMNS = ["Gender", "Senior Citizen"]
 
+# Explicit publication-grade feature allowlist. Unknown workbook columns are never
+# admitted to the predictive model implicitly.
+MODEL_FEATURES = [
+    "Partner",
+    "Dependents",
+    "Tenure Months",
+    "Phone Service",
+    "Multiple Lines",
+    "Internet Service",
+    "Online Security",
+    "Online Backup",
+    "Device Protection",
+    "Tech Support",
+    "Streaming TV",
+    "Streaming Movies",
+    "Contract",
+    "Paperless Billing",
+    "Payment Method",
+    "Monthly Charges",
+    "Total Charges",
+]
+
 
 @dataclass
 class BusinessConfig:
@@ -128,6 +150,14 @@ def parse_args():
     p.add_argument("--budget-fraction", type=float, default=0.20)
     p.add_argument("--gross-margin-rate", type=float, default=0.60)
     p.add_argument("--value-horizon-months", type=int, default=12)
+
+    # KGDI policy parameters are exposed explicitly for reproducibility.
+    p.add_argument("--minimum-churn-risk", type=float, default=0.20)
+    p.add_argument("--uncertainty-threshold", type=float, default=0.65)
+    p.add_argument("--moderate-uncertainty-threshold", type=float, default=0.45)
+    p.add_argument("--high-value-quantile", type=float, default=0.75)
+    p.add_argument("--cltv-priority-weight", type=float, default=0.03)
+    p.add_argument("--review-utility-tolerance", type=float, default=0.90)
     return p.parse_args()
 
 
@@ -154,6 +184,25 @@ def validate_args(args):
         raise ValueError("--repeats must be >= 1")
     if args.bootstrap is not None and args.bootstrap < 100:
         raise ValueError("--bootstrap must be >= 100")
+
+    for name in [
+        "minimum_churn_risk",
+        "uncertainty_threshold",
+        "moderate_uncertainty_threshold",
+        "high_value_quantile",
+    ]:
+        value = getattr(args, name)
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(f"--{name.replace('_', '-')} must be in [0, 1]")
+
+    if args.moderate_uncertainty_threshold > args.uncertainty_threshold:
+        raise ValueError(
+            "--moderate-uncertainty-threshold must be <= --uncertainty-threshold"
+        )
+    if args.cltv_priority_weight < 0:
+        raise ValueError("--cltv-priority-weight must be >= 0")
+    if args.review_utility_tolerance < 0:
+        raise ValueError("--review-utility-tolerance must be >= 0")
 
 
 # -----------------------------------------------------------------------------
@@ -219,11 +268,10 @@ def clean_data(df: pd.DataFrame):
     zero_tenure_fixed = int(zero_tenure_blank.sum())
     df.loc[zero_tenure_blank, "Total Charges"] = 0.0
 
+    # Any remaining Total Charges missingness is intentionally preserved here.
+    # It is imputed inside each training fold by the preprocessing pipeline,
+    # preventing full-dataset distribution information from entering CV folds.
     remaining_total_missing = int(df["Total Charges"].isna().sum())
-    if remaining_total_missing:
-        # This fallback is documented. The model pipeline also performs fold-local
-        # median imputation, so this does not use target information.
-        df["Total Charges"] = df["Total Charges"].fillna(df["Total Charges"].median())
 
     if df["Monthly Charges"].isna().any() or df["CLTV"].isna().any():
         raise ValueError("Monthly Charges and CLTV must be present for the decision layer")
@@ -238,20 +286,19 @@ def clean_data(df: pd.DataFrame):
         "churn_rate": float(df[TARGET].mean()),
         "duplicate_customer_ids": int(df["CustomerID"].duplicated().sum()),
         "zero_tenure_total_charges_set_to_zero": zero_tenure_fixed,
-        "remaining_total_charges_imputed": remaining_total_missing,
+        "remaining_total_charges_left_for_fold_local_imputation": remaining_total_missing,
     }
     return df, audit
 
 
 def select_features(df):
-    excluded = set(
-        LEAKAGE_COLUMNS
-        + IDENTIFIER_GEO_COLUMNS
-        + BUSINESS_ONLY_COLUMNS
-        + AUDIT_ONLY_COLUMNS
-        + [TARGET]
-    )
-    features = [c for c in df.columns if c not in excluded]
+    missing = [c for c in MODEL_FEATURES if c not in df.columns]
+    if missing:
+        raise ValueError(f"Required predictive features missing: {missing}")
+
+    # Fixed allowlist prevents schema drift or newly added outcome-derived fields
+    # from silently entering the predictive model.
+    features = list(MODEL_FEATURES)
     numeric = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
     categorical = [c for c in features if c not in numeric]
     return features, numeric, categorical
@@ -270,8 +317,10 @@ def save_column_roles(df, output_dir):
             role = "audit_only"
         elif c in IDENTIFIER_GEO_COLUMNS:
             role = "exclude_identifier_or_geography"
-        else:
+        elif c in MODEL_FEATURES:
             role = "ai_feature"
+        else:
+            role = "excluded_unrecognized_column"
 
         rows.append({
             "column": c,
@@ -772,7 +821,8 @@ def customer_contributions(d, actions, cfg):
 
     nonchurn_review = review & (y == 0)
     unnecessary_cost[nonchurn_review] = (
-        cfg.offer_cost * (1 - cfg.human_accuracy)
+        cfg.human_review_cost
+        + cfg.offer_cost * (1 - cfg.human_accuracy)
     )
 
     return pd.DataFrame({
@@ -788,7 +838,18 @@ def customer_contributions(d, actions, cfg):
     })
 
 
-def evaluate_policy(d, actions, cfg):
+def expected_selected_cost(d, actions, cfg):
+    """Ex-ante expected cost used by the budget-constrained policy allocator."""
+    v = business_vectors(d, cfg)
+    offer = actions == "Retention Offer"
+    review = actions == "Human Review"
+    return float(
+        np.sum(offer) * cfg.offer_cost
+        + np.sum(v["review_expected_cost"][review])
+    )
+
+
+def evaluate_policy(d, actions, cfg, planning_budget=None):
     c = customer_contributions(d, actions, cfg)
     total_churn = int(c["true_churn"].sum())
     total_high_value_churn = int(c["high_value_churn"].sum())
@@ -800,7 +861,10 @@ def evaluate_policy(d, actions, cfg):
         ((c["high_value_churn"] == 1) & (c["intervened"] == 1)).sum()
     )
 
-    return {
+    expected_cost = expected_selected_cost(d, actions, cfg)
+    outcome_cost = float(c["cost"].sum())
+
+    result = {
         "offers": int(np.sum(actions == "Retention Offer")),
         "human_reviews": int(np.sum(actions == "Human Review")),
         "interventions": int(c["intervened"].sum()),
@@ -809,13 +873,22 @@ def evaluate_policy(d, actions, cfg):
         "high_value_churn_reach_rate": (
             reached_high / total_high_value_churn if total_high_value_churn else np.nan
         ),
-        "total_cost": float(c["cost"].sum()),
+        "total_cost": outcome_cost,
+        "outcome_anchored_cost": outcome_cost,
+        "expected_selected_cost": expected_cost,
+        "expected_vs_outcome_cost_delta": outcome_cost - expected_cost,
         "saved_value_proxy": float(c["saved_value"].sum()),
         "net_benefit_proxy": float(c["net_benefit"].sum()),
         "unnecessary_intervention_cost": float(
             c["unnecessary_intervention_cost"].sum()
         ),
     }
+    if planning_budget is not None:
+        result["planning_budget"] = float(planning_budget)
+        result["budget_utilization"] = (
+            expected_cost / planning_budget if planning_budget > 0 else np.nan
+        )
+    return result
 
 
 def run_decision_experiment(df, ensemble_by_repeat, cfg):
@@ -835,7 +908,7 @@ def run_decision_experiment(df, ensemble_by_repeat, cfg):
 
         for name, actions in policies.items():
             row = {"repeat": repeat_id + 1, "strategy": name, "budget": float(budget)}
-            row.update(evaluate_policy(d, actions, cfg))
+            row.update(evaluate_policy(d, actions, cfg, planning_budget=budget))
             rows.append(row)
             d[f"action_{name}"] = actions
 
@@ -897,8 +970,8 @@ def bootstrap_policy_delta(d, cfg, n_boot, seed):
     base_unc = policy_uncertainty_review(d, cfg, base_budget)
     base_kgdi = policy_kgdi(d, cfg, base_budget)
     observed_delta = (
-        evaluate_policy(d, base_kgdi, cfg)["net_benefit_proxy"]
-        - evaluate_policy(d, base_unc, cfg)["net_benefit_proxy"]
+        evaluate_policy(d, base_kgdi, cfg, planning_budget=base_budget)["net_benefit_proxy"]
+        - evaluate_policy(d, base_unc, cfg, planning_budget=base_budget)["net_benefit_proxy"]
     )
 
     for b in range(n_boot):
@@ -910,8 +983,8 @@ def bootstrap_policy_delta(d, cfg, n_boot, seed):
         unc = policy_uncertainty_review(sample, cfg, budget)
         kgdi = policy_kgdi(sample, cfg, budget)
 
-        unc_nb = evaluate_policy(sample, unc, cfg)["net_benefit_proxy"]
-        kgdi_nb = evaluate_policy(sample, kgdi, cfg)["net_benefit_proxy"]
+        unc_nb = evaluate_policy(sample, unc, cfg, planning_budget=budget)["net_benefit_proxy"]
+        kgdi_nb = evaluate_policy(sample, kgdi, cfg, planning_budget=budget)["net_benefit_proxy"]
         deltas[b] = kgdi_nb - unc_nb
 
     return {
@@ -936,8 +1009,42 @@ def run_ablations(d, cfg):
     rows = []
     for name, actions in variants.items():
         row = {"variant": name}
-        row.update(evaluate_policy(d, actions, cfg))
+        row.update(evaluate_policy(d, actions, cfg, planning_budget=budget))
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+
+def policy_distinctness_report(d, cfg, kgdi, uncertainty, costaware):
+    """Quantify whether KGDI materially changes actions and which components do so."""
+    budget = len(d) * cfg.offer_cost * cfg.budget_fraction
+    variants = {
+        "KGDI_vs_Uncertainty_Review": (kgdi, uncertainty),
+        "KGDI_vs_Cost_Aware": (kgdi, costaware),
+        "CLTV_component_Full_vs_No_CLTV": (
+            kgdi, policy_kgdi(d, cfg, budget, True, False, True)
+        ),
+        "Uncertainty_component_Full_vs_No_Uncertainty": (
+            kgdi, policy_kgdi(d, cfg, budget, False, True, True)
+        ),
+        "HumanReview_component_Full_vs_No_Human_Review": (
+            kgdi, policy_kgdi(d, cfg, budget, True, True, False)
+        ),
+    }
+    rows = []
+    for comparison, (a, b) in variants.items():
+        changed = a != b
+        rows.append({
+            "comparison": comparison,
+            "different_actions": int(np.sum(changed)),
+            "disagreement_rate": float(np.mean(changed)),
+            "kgdi_no_action": int(np.sum(a == "No Action")),
+            "kgdi_retention_offer": int(np.sum(a == "Retention Offer")),
+            "kgdi_human_review": int(np.sum(a == "Human Review")),
+            "comparator_no_action": int(np.sum(b == "No Action")),
+            "comparator_retention_offer": int(np.sum(b == "Retention Offer")),
+            "comparator_human_review": int(np.sum(b == "Human Review")),
+        })
     return pd.DataFrame(rows)
 
 
@@ -985,9 +1092,9 @@ def evaluate_sensitivity_scenario(d, base_cfg, scenario_name, **changes):
     kgdi = policy_kgdi(s, cfg, budget)
     costaware = policy_cost_aware(s, cfg, budget)
 
-    m_u = evaluate_policy(s, uncertainty, cfg)
-    m_k = evaluate_policy(s, kgdi, cfg)
-    m_c = evaluate_policy(s, costaware, cfg)
+    m_u = evaluate_policy(s, uncertainty, cfg, planning_budget=budget)
+    m_k = evaluate_policy(s, kgdi, cfg, planning_budget=budget)
+    m_c = evaluate_policy(s, costaware, cfg, planning_budget=budget)
 
     return {
         "scenario": scenario_name,
@@ -1232,6 +1339,11 @@ def reproducibility_metadata(args, cfg, repeats, n_boot):
         "threads_per_model": args.threads,
         "cpu_count_visible": os.cpu_count(),
         "business_parameters": asdict(cfg),
+        "model_feature_allowlist": MODEL_FEATURES,
+        "budget_definition": (
+            "Planning constraint is enforced using ex-ante expected selected cost. "
+            "Outcome-anchored realized/simulated cost is reported separately."
+        ),
         "business_value_definition": (
             "Simulated revenue-at-risk proxy = Monthly Charges × value horizon months "
             "× gross margin rate. IBM CLTV is used only as a dimensionless strategic "
@@ -1271,7 +1383,16 @@ def reproducibility_metadata(args, cfg, repeats, n_boot):
 # -----------------------------------------------------------------------------
 
 def main():
-    warnings.filterwarnings("ignore")
+    # Do not globally suppress warnings in research runs. Filter only this known
+    # benign sklearn/LightGBM feature-name interoperability warning.
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            "X does not have valid feature names, but LGBMClassifier was fitted "
+            "with feature names"
+        ),
+        category=UserWarning,
+    )
     args = parse_args()
     validate_args(args)
 
@@ -1286,6 +1407,12 @@ def main():
         budget_fraction=args.budget_fraction,
         gross_margin_rate=args.gross_margin_rate,
         value_horizon_months=args.value_horizon_months,
+        minimum_churn_risk=args.minimum_churn_risk,
+        uncertainty_threshold=args.uncertainty_threshold,
+        moderate_uncertainty_threshold=args.moderate_uncertainty_threshold,
+        high_value_quantile=args.high_value_quantile,
+        cltv_priority_weight=args.cltv_priority_weight,
+        review_utility_tolerance=args.review_utility_tolerance,
     )
 
     output_dir = Path(args.output)
@@ -1310,6 +1437,7 @@ def main():
         "leakage_excluded": LEAKAGE_COLUMNS,
         "business_only": BUSINESS_ONLY_COLUMNS,
         "audit_only": AUDIT_ONLY_COLUMNS,
+        "model_feature_allowlist": MODEL_FEATURES,
     })
 
     with open(output_dir / "data_audit.json", "w") as f:
@@ -1361,6 +1489,24 @@ def main():
     final_costaware = policy_cost_aware(final_d, cfg, budget)
     final_uncertainty = policy_uncertainty_review(final_d, cfg, budget)
     final_kgdi = policy_kgdi(final_d, cfg, budget)
+
+    distinctness = policy_distinctness_report(
+        final_d, cfg, final_kgdi, final_uncertainty, final_costaware
+    )
+    distinctness.to_csv(
+        output_dir / "SUPPLEMENT_policy_distinctness.csv", index=False
+    )
+    kgdi_vs_unc = distinctness.loc[
+        distinctness["comparison"] == "KGDI_vs_Uncertainty_Review",
+        "different_actions",
+    ]
+    if len(kgdi_vs_unc) and int(kgdi_vs_unc.iloc[0]) == 0:
+        warnings.warn(
+            "KGDI and Uncertainty Review generated identical actions under the "
+            "current configuration. Do not claim incremental KGDI benefit for "
+            "this configuration.",
+            RuntimeWarning,
+        )
 
     bootstrap_result = bootstrap_policy_delta(
         final_d, cfg, n_boot, args.seed + 909

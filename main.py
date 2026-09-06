@@ -112,7 +112,8 @@ class BusinessConfig:
     offer_cost: float = 100.0
     retention_success: float = 0.35
     human_review_cost: float = 25.0
-    human_accuracy: float = 0.85
+    human_sensitivity: float = 0.85
+    human_specificity: float = 0.85
     budget_fraction: float = 0.20
 
     gross_margin_rate: float = 0.60
@@ -146,7 +147,8 @@ def parse_args():
     p.add_argument("--offer-cost", type=float, default=100.0)
     p.add_argument("--retention-success", type=float, default=0.35)
     p.add_argument("--human-review-cost", type=float, default=25.0)
-    p.add_argument("--human-accuracy", type=float, default=0.85)
+    p.add_argument("--human-sensitivity", type=float, default=0.85)
+    p.add_argument("--human-specificity", type=float, default=0.85)
     p.add_argument("--budget-fraction", type=float, default=0.20)
     p.add_argument("--gross-margin-rate", type=float, default=0.60)
     p.add_argument("--value-horizon-months", type=int, default=12)
@@ -174,7 +176,11 @@ def validate_args(args):
         raise ValueError("--value-horizon-months must be >= 1")
 
     for name in [
-        "retention_success", "human_accuracy", "budget_fraction", "gross_margin_rate"
+        "retention_success",
+        "human_sensitivity",
+        "human_specificity",
+        "budget_fraction",
+        "gross_margin_rate",
     ]:
         value = getattr(args, name)
         if not (0 < value <= 1):
@@ -617,17 +623,17 @@ def business_vectors(d, cfg: BusinessConfig):
 
     offer_utility = p * cfg.retention_success * annual_value - cfg.offer_cost
 
-    # A reviewer can either recommend an offer correctly or create a false positive.
+    # Human review is modeled with separate true-positive and true-negative rates.
     expected_review_offer_probability = (
-        p * cfg.human_accuracy
-        + (1 - p) * (1 - cfg.human_accuracy)
+        p * cfg.human_sensitivity
+        + (1 - p) * (1 - cfg.human_specificity)
     )
     review_expected_cost = (
         cfg.human_review_cost
         + cfg.offer_cost * expected_review_offer_probability
     )
     review_utility = (
-        p * cfg.human_accuracy * cfg.retention_success * annual_value
+        p * cfg.human_sensitivity * cfg.retention_success * annual_value
         - review_expected_cost
     )
 
@@ -805,16 +811,16 @@ def customer_contributions(d, actions, cfg):
     unnecessary_cost[offer & (y == 0)] = cfg.offer_cost
 
     # Human-review path.
-    # True churner -> correct-positive follow-up offer with probability accuracy.
-    # Non-churner -> false-positive follow-up offer with probability 1-accuracy.
+    # True churner -> follow-up offer with probability sensitivity.
+    # Non-churner -> false-positive follow-up offer with probability 1-specificity.
     review_offer_prob = (
-        y[review] * cfg.human_accuracy
-        + (1 - y[review]) * (1 - cfg.human_accuracy)
+        y[review] * cfg.human_sensitivity
+        + (1 - y[review]) * (1 - cfg.human_specificity)
     )
     cost[review] = cfg.human_review_cost + cfg.offer_cost * review_offer_prob
     saved[review] = (
         y[review]
-        * cfg.human_accuracy
+        * cfg.human_sensitivity
         * cfg.retention_success
         * annual_value[review]
     )
@@ -822,7 +828,7 @@ def customer_contributions(d, actions, cfg):
     nonchurn_review = review & (y == 0)
     unnecessary_cost[nonchurn_review] = (
         cfg.human_review_cost
-        + cfg.offer_cost * (1 - cfg.human_accuracy)
+        + cfg.offer_cost * (1 - cfg.human_specificity)
     )
 
     return pd.DataFrame({
@@ -1113,8 +1119,8 @@ def sensitivity_analysis(d, base_cfg):
     """
     Compact but broad robustness design:
     A) 3x3x3 operational grid: offer cost x success x budget;
-    B) one-factor-at-a-time reviewer-proofing for margin, reviewer accuracy,
-       horizon, uncertainty threshold, and CLTV priority weight.
+    B) one-factor-at-a-time reviewer-proofing for margin, human sensitivity,
+       human specificity, horizon, uncertainty threshold, and CLTV priority weight.
     """
     rows = []
 
@@ -1133,7 +1139,8 @@ def sensitivity_analysis(d, base_cfg):
 
     ofat = {
         "gross_margin_rate": [0.40, 0.60, 0.80],
-        "human_accuracy": [0.70, 0.85, 0.95],
+        "human_sensitivity": [0.70, 0.85, 0.95],
+        "human_specificity": [0.70, 0.85, 0.95],
         "value_horizon_months": [6, 12, 18],
         "uncertainty_threshold": [0.55, 0.65, 0.75],
         "cltv_priority_weight": [0.00, 0.03, 0.06],
@@ -1182,16 +1189,18 @@ def make_table_1(model_metrics):
     return pd.DataFrame(rows)
 
 
-def make_table_2(decision_metrics, bootstrap_result):
+def make_table_2(final_policy_metrics, bootstrap_result):
+    """Primary decision table from one consistent final aggregated OOF policy set."""
     rows = []
     order = [
         "Probability_Threshold", "Cost_Aware", "Uncertainty_Review", "Proposed_KGDI"
     ]
 
     for strategy in order:
-        g = decision_metrics[decision_metrics["strategy"] == strategy]
+        g = final_policy_metrics[final_policy_metrics["strategy"] == strategy]
         if g.empty:
             continue
+        r = g.iloc[0]
 
         delta = ""
         ci = ""
@@ -1206,12 +1215,13 @@ def make_table_2(decision_metrics, bootstrap_result):
 
         rows.append({
             "Strategy": strategy,
-            "Intervention %": mean_sd_string(100 * g["intervention_rate"], 1),
-            "Churn reach %": mean_sd_string(100 * g["churn_reach_rate"], 1),
-            "High-value churn reach %": mean_sd_string(
-                100 * g["high_value_churn_reach_rate"], 1
+            "Intervention %": f"{100 * r['intervention_rate']:.1f}",
+            "Churn reach %": f"{100 * r['churn_reach_rate']:.1f}",
+            "High-value churn reach %": (
+                f"{100 * r['high_value_churn_reach_rate']:.1f}"
             ),
-            "Net benefit proxy ($)": mean_sd_string(g["net_benefit_proxy"], 2),
+            "Expected selected cost ($)": f"{r['expected_selected_cost']:.2f}",
+            "Outcome-anchored net benefit proxy ($)": f"{r['net_benefit_proxy']:.2f}",
             "KGDI Δ vs uncertainty ($)": delta,
             "95% policy-rerun bootstrap CI": ci,
             "Bootstrap P(Δ>0)": p_positive,
@@ -1351,8 +1361,9 @@ def reproducibility_metadata(args, cfg, repeats, n_boot):
         ),
         "uncertainty_definition": (
             "Primary uncertainty = normalized binary predictive entropy of the "
-            "calibrated ensemble probability. Cross-model standard deviation is "
-            "reported separately as a model-disagreement diagnostic."
+            "calibrated ensemble probability. Standard deviation across all model × "
+            "repeat OOF probabilities is reported separately as a disagreement "
+            "diagnostic capturing both between-model and between-repeat variation."
         ),
         "inference_definition": (
             "Main KGDI effect uses paired customer bootstrap with policy rerouting and "
@@ -1361,8 +1372,9 @@ def reproducibility_metadata(args, cfg, repeats, n_boot):
         ),
         "methodological_disclosure": (
             "IBM customer variables and churn outcomes are observed dataset fields. "
-            "Retention cost, intervention success, human-review cost/accuracy, gross "
-            "margin, value horizon, and budget are simulated assumptions."
+            "Retention cost, intervention success, human-review cost/sensitivity/"
+            "specificity, gross margin, value horizon, and budget are simulated "
+            "assumptions."
         ),
         "software_versions": {
             "python": sys.version,
@@ -1403,7 +1415,8 @@ def main():
         offer_cost=args.offer_cost,
         retention_success=args.retention_success,
         human_review_cost=args.human_review_cost,
-        human_accuracy=args.human_accuracy,
+        human_sensitivity=args.human_sensitivity,
+        human_specificity=args.human_specificity,
         budget_fraction=args.budget_fraction,
         gross_margin_rate=args.gross_margin_rate,
         value_horizon_months=args.value_horizon_months,
@@ -1468,13 +1481,13 @@ def main():
     stacked_p = np.vstack([
         ensemble_by_repeat[r]["probability"] for r in sorted(ensemble_by_repeat)
     ])
-    stacked_dis = np.vstack([
-        ensemble_by_repeat[r]["model_disagreement"] for r in sorted(ensemble_by_repeat)
-    ])
+    all_model_repeat_probs = np.concatenate([
+        ensemble_by_repeat[r]["model_matrix"] for r in sorted(ensemble_by_repeat)
+    ], axis=0)
 
     final_probability = stacked_p.mean(axis=0)
     final_entropy = binary_entropy(final_probability)
-    final_disagreement = stacked_dis.mean(axis=0)
+    final_disagreement = all_model_repeat_probs.std(axis=0, ddof=0)
 
     final_info = {
         "probability": final_probability,
@@ -1489,6 +1502,22 @@ def main():
     final_costaware = policy_cost_aware(final_d, cfg, budget)
     final_uncertainty = policy_uncertainty_review(final_d, cfg, budget)
     final_kgdi = policy_kgdi(final_d, cfg, budget)
+
+    final_policy_actions = {
+        "Probability_Threshold": final_probability_threshold,
+        "Cost_Aware": final_costaware,
+        "Uncertainty_Review": final_uncertainty,
+        "Proposed_KGDI": final_kgdi,
+    }
+    final_policy_rows = []
+    for strategy, actions in final_policy_actions.items():
+        row = {"strategy": strategy}
+        row.update(evaluate_policy(final_d, actions, cfg, planning_budget=budget))
+        final_policy_rows.append(row)
+    final_policy_metrics = pd.DataFrame(final_policy_rows)
+    final_policy_metrics.to_csv(
+        output_dir / "SUPPLEMENT_final_policy_metrics.csv", index=False
+    )
 
     distinctness = policy_distinctness_report(
         final_d, cfg, final_kgdi, final_uncertainty, final_costaware
@@ -1526,7 +1555,7 @@ def main():
     sensitivity.to_csv(output_dir / "SUPPLEMENT_sensitivity_full.csv", index=False)
 
     table1 = make_table_1(model_metrics)
-    table2 = make_table_2(decision_metrics, bootstrap_result)
+    table2 = make_table_2(final_policy_metrics, bootstrap_result)
     table1.to_csv(output_dir / "TABLE_1_predictive_performance.csv", index=False)
     table2.to_csv(output_dir / "TABLE_2_decision_performance.csv", index=False)
 

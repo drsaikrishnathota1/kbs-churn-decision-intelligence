@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Do not publish IBM dataset
+data/*
+!data/.gitkeep
+
+# Generated results
+results/*
+!results/.gitkeep

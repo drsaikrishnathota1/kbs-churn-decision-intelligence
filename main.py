@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
-
 """
-Knowledge-Guided Decision Intelligence for Cost-Aware
-Customer Churn Intervention Under Predictive Uncertainty
+Knowledge-Guided Decision Intelligence for Cost-Aware Customer Churn
+Intervention Under Predictive Uncertainty
 
-Single-file reproducible experimental pipeline.
+Single-file experimental pipeline for a Knowledge-Based Systems short communication.
 
-Real IBM data:
-- customer characteristics
-- services
-- charges
-- tenure
-- churn outcome
-- CLTV
+Core design:
+1) leakage-safe repeated out-of-fold churn prediction;
+2) probability calibration using a held-out calibration partition;
+3) composite predictive uncertainty from entropy + model disagreement;
+4) unit-consistent business utility using a 12-month gross-margin revenue-at-risk proxy;
+5) CLTV used only as a dimensionless strategic-priority index, not as dollars;
+6) fair budget-matched policy comparisons;
+7) repeated-CV robustness, customer-level paired bootstrap, ablations, subgroup audit;
+8) only two primary tables and two manuscript-ready figures.
 
-Simulated business parameters:
-- retention offer cost
-- retention success probability
-- management budget
-- human review cost
-- human review accuracy
-- uncertainty penalty
+IBM variables are observed dataset fields.
+Business costs/effectiveness/margin assumptions are explicit simulation parameters.
 """
+
+from __future__ import annotations
 
 import argparse
 import io
@@ -31,20 +29,17 @@ import platform
 import sys
 import warnings
 import zipfile
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-
-import numpy as np
-import pandas as pd
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
+import numpy as np
+import pandas as pd
 from scipy.stats import wilcoxon
 
 from sklearn.base import clone
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
@@ -59,7 +54,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -67,144 +62,79 @@ from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 TARGET = "Churn Value"
 
-LEAKAGE_COLUMNS = [
-    "Churn Label",
-    "Churn Score",
-    "Churn Reason",
+LEAKAGE_COLUMNS = ["Churn Label", "Churn Score", "Churn Reason"]
+
+IDENTIFIER_GEO_COLUMNS = [
+    "CustomerID", "Count", "Country", "State", "City",
+    "Zip Code", "Lat Long", "Latitude", "Longitude",
 ]
 
-ID_GEO_COLUMNS = [
-    "CustomerID",
-    "Count",
-    "Country",
-    "State",
-    "City",
-    "Zip Code",
-    "Lat Long",
-    "Latitude",
-    "Longitude",
-]
+# CLTV is an IBM customer-value index. It is not treated as currency.
+BUSINESS_ONLY_COLUMNS = ["CLTV"]
 
-# CLTV is intentionally NOT given to the AI churn predictor.
-# It is reserved for the downstream business decision layer.
-BUSINESS_ONLY_COLUMNS = [
-    "CLTV",
-]
-
-# Excluded from primary prediction model but retained in source data.
-AUDIT_ONLY_COLUMNS = [
-    "Gender",
-    "Senior Citizen",
-]
+# Excluded from the primary model; retained only for post-hoc audit.
+AUDIT_ONLY_COLUMNS = ["Gender", "Senior Citizen"]
 
 
 @dataclass
 class BusinessConfig:
     offer_cost: float = 100.0
     retention_success: float = 0.35
-
     human_review_cost: float = 25.0
     human_accuracy: float = 0.85
-
     budget_fraction: float = 0.20
+
+    gross_margin_rate: float = 0.60
+    value_horizon_months: int = 12
 
     minimum_churn_risk: float = 0.20
     uncertainty_threshold: float = 0.65
-
+    moderate_uncertainty_threshold: float = 0.45
     high_value_quantile: float = 0.75
+    cltv_priority_weight: float = 0.03
+    review_utility_tolerance: float = 0.90
 
-    uncertainty_penalty: float = 0.20
-
-    top_risk_fraction: float = 0.20
-
-
-# ============================================================
-# COMMAND-LINE ARGUMENTS
-# ============================================================
 
 def parse_args():
-
-    parser = argparse.ArgumentParser(
-        description="KBS AI + Decision Intelligence churn experiment"
+    p = argparse.ArgumentParser(
+        description="Q1-style AI + Decision Intelligence churn experiment"
     )
+    p.add_argument("--data", required=True, help=".xlsx or ZIP containing the IBM workbook")
+    p.add_argument("--output", default="results/paper")
+    p.add_argument("--mode", choices=["quick", "paper"], default="paper")
+    p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--folds", type=int, default=5)
+    p.add_argument("--repeats", type=int, default=None)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--bootstrap", type=int, default=None)
 
-    parser.add_argument(
-        "--data",
-        required=True,
-        help="IBM Telco .xlsx file or ZIP containing it"
-    )
-
-    parser.add_argument(
-        "--output",
-        default="results/paper",
-        help="Output directory"
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["quick", "paper"],
-        default="paper"
-    )
-
-    parser.add_argument(
-        "--seeds",
-        default=None,
-        help="Optional seeds such as 42,52,62,72,82"
-    )
-
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.20
-    )
-
-    parser.add_argument(
-        "--offer-cost",
-        type=float,
-        default=100.0
-    )
-
-    parser.add_argument(
-        "--retention-success",
-        type=float,
-        default=0.35
-    )
-
-    parser.add_argument(
-        "--human-review-cost",
-        type=float,
-        default=25.0
-    )
-
-    parser.add_argument(
-        "--human-accuracy",
-        type=float,
-        default=0.85
-    )
-
-    parser.add_argument(
-        "--budget-fraction",
-        type=float,
-        default=0.20
-    )
-
-    return parser.parse_args()
+    p.add_argument("--offer-cost", type=float, default=100.0)
+    p.add_argument("--retention-success", type=float, default=0.35)
+    p.add_argument("--human-review-cost", type=float, default=25.0)
+    p.add_argument("--human-accuracy", type=float, default=0.85)
+    p.add_argument("--budget-fraction", type=float, default=0.20)
+    p.add_argument("--gross-margin-rate", type=float, default=0.60)
+    p.add_argument("--value-horizon-months", type=int, default=12)
+    return p.parse_args()
 
 
-# ============================================================
-# DATA LOADING
-# ============================================================
+def validate_args(args):
+    if args.folds < 3:
+        raise ValueError("--folds must be >= 3")
+    if args.threads < 1:
+        raise ValueError("--threads must be >= 1")
+    for name in [
+        "retention_success", "human_accuracy", "budget_fraction", "gross_margin_rate"
+    ]:
+        value = getattr(args, name.replace("-", "_"), None)
+        if value is not None and not (0 < value <= 1):
+            raise ValueError(f"--{name.replace('_', '-')} must be in (0, 1]")
 
-def load_data(path):
 
+def load_data(path: str) -> pd.DataFrame:
     path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError(f"Dataset not found: {path}")
 
@@ -212,2261 +142,1145 @@ def load_data(path):
         return pd.read_excel(path)
 
     if path.suffix.lower() == ".zip":
-
         with zipfile.ZipFile(path, "r") as z:
-
-            files = [
+            candidates = [
                 f for f in z.namelist()
                 if f.lower().endswith(".xlsx")
                 and not f.startswith("__MACOSX")
+                and not Path(f).name.startswith("~$")
             ]
-
-            if not files:
-                raise ValueError("No .xlsx file found inside ZIP")
-
-            preferred = [
-                f for f in files
-                if Path(f).name.lower()
-                == "telco_customer_churn.xlsx"
+            if not candidates:
+                raise ValueError("No .xlsx workbook found inside ZIP.")
+            exact = [
+                f for f in candidates
+                if Path(f).name.lower() == "telco_customer_churn.xlsx"
             ]
-
-            selected = preferred[0] if preferred else files[0]
-
+            selected = exact[0] if exact else sorted(candidates)[0]
             print(f"Workbook selected: {selected}")
-
             with z.open(selected) as f:
                 return pd.read_excel(io.BytesIO(f.read()))
 
-    raise ValueError(
-        "Dataset must be .xlsx or .zip containing .xlsx"
-    )
+    raise ValueError("Dataset must be .xlsx or .zip containing an .xlsx workbook.")
 
 
-# ============================================================
-# DATA VALIDATION AND CLEANING
-# ============================================================
-
-def clean_data(df):
-
+def clean_data(df: pd.DataFrame):
     required = [
-        "CustomerID",
-        "Tenure Months",
-        "Monthly Charges",
-        "Total Charges",
-        "CLTV",
-        TARGET,
+        "CustomerID", "Tenure Months", "Monthly Charges",
+        "Total Charges", "CLTV", TARGET
     ]
-
-    missing = [
-        c for c in required
-        if c not in df.columns
-    ]
-
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"Required columns missing: {missing}"
-        )
+        raise ValueError(f"Required columns missing: {missing}")
 
     df = df.copy()
 
-    # IBM sample contains blank Total Charges values for
-    # customers with zero tenure.
-    df["Total Charges"] = pd.to_numeric(
-        df["Total Charges"],
-        errors="coerce"
-    )
+    # Numeric normalization.
+    for c in ["Tenure Months", "Monthly Charges", "Total Charges", "CLTV", TARGET]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    new_customer_mask = (
-        df["Total Charges"].isna()
-        & (df["Tenure Months"] == 0)
-    )
+    if df[TARGET].isna().any():
+        raise ValueError("Churn Value contains non-numeric/missing values.")
 
-    new_customer_count = int(
-        new_customer_mask.sum()
-    )
+    df[TARGET] = df[TARGET].astype(int)
+    if not set(df[TARGET].unique()).issubset({0, 1}):
+        raise ValueError("Churn Value must be binary 0/1.")
 
-    df.loc[
-        new_customer_mask,
-        "Total Charges"
-    ] = 0.0
+    if df["CustomerID"].isna().any() or df["CustomerID"].duplicated().any():
+        raise ValueError("CustomerID must be complete and unique.")
 
-    # Defensive handling for any remaining missing values.
-    if df["Total Charges"].isna().any():
+    zero_tenure_blank = df["Total Charges"].isna() & (df["Tenure Months"] == 0)
+    fixed_zero = int(zero_tenure_blank.sum())
+    df.loc[zero_tenure_blank, "Total Charges"] = 0.0
 
-        median_value = df[
-            "Total Charges"
-        ].median()
+    remaining_total_missing = int(df["Total Charges"].isna().sum())
+    if remaining_total_missing:
+        # Conservative fallback; model pipeline also imputes remaining numeric values.
+        df["Total Charges"] = df["Total Charges"].fillna(df["Total Charges"].median())
 
-        df["Total Charges"] = (
-            df["Total Charges"]
-            .fillna(median_value)
-        )
-
-    df[TARGET] = pd.to_numeric(
-        df[TARGET],
-        errors="raise"
-    ).astype(int)
-
-    if not set(
-        df[TARGET].unique()
-    ).issubset({0, 1}):
-
-        raise ValueError(
-            "Churn Value must contain only 0 and 1"
-        )
-
-    if df["CustomerID"].duplicated().any():
-        raise ValueError(
-            "Duplicate CustomerID values detected"
-        )
+    if (df["Monthly Charges"] < 0).any() or (df["CLTV"] < 0).any():
+        raise ValueError("Negative Monthly Charges or CLTV values detected.")
 
     audit = {
         "rows": int(len(df)),
         "columns": int(df.shape[1]),
         "churners": int(df[TARGET].sum()),
-        "non_churners": int(
-            (df[TARGET] == 0).sum()
-        ),
-        "churn_rate": float(
-            df[TARGET].mean()
-        ),
-        "zero_tenure_total_charges_fixed":
-            new_customer_count,
+        "non_churners": int((df[TARGET] == 0).sum()),
+        "churn_rate": float(df[TARGET].mean()),
+        "duplicate_customer_ids": int(df["CustomerID"].duplicated().sum()),
+        "zero_tenure_total_charges_set_to_zero": fixed_zero,
+        "remaining_total_charges_imputed": remaining_total_missing,
     }
-
     return df, audit
 
 
-# ============================================================
-# LEAKAGE-SAFE FEATURE SELECTION
-# ============================================================
-
 def select_features(df):
-
     excluded = set(
         LEAKAGE_COLUMNS
-        + ID_GEO_COLUMNS
+        + IDENTIFIER_GEO_COLUMNS
         + BUSINESS_ONLY_COLUMNS
         + AUDIT_ONLY_COLUMNS
         + [TARGET]
     )
-
-    features = [
-        c for c in df.columns
-        if c not in excluded
-    ]
-
-    numeric = [
-        c for c in features
-        if pd.api.types.is_numeric_dtype(df[c])
-    ]
-
-    categorical = [
-        c for c in features
-        if c not in numeric
-    ]
-
+    features = [c for c in df.columns if c not in excluded]
+    numeric = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
+    categorical = [c for c in features if c not in numeric]
     return features, numeric, categorical
 
 
-# ============================================================
-# PREPROCESSING
-# ============================================================
-
-def create_preprocessor(
-    numeric,
-    categorical
-):
-
-    numeric_pipeline = Pipeline(
-        steps=[
-            (
-                "imputer",
-                SimpleImputer(
-                    strategy="median"
-                )
-            ),
-            (
-                "scaler",
-                StandardScaler()
-            ),
-        ]
-    )
-
-    categorical_pipeline = Pipeline(
-        steps=[
-            (
-                "imputer",
-                SimpleImputer(
-                    strategy="most_frequent"
-                )
-            ),
-            (
-                "onehot",
-                OneHotEncoder(
-                    handle_unknown="ignore",
-                    sparse_output=True
-                )
-            ),
-        ]
-    )
-
-    return ColumnTransformer(
-        transformers=[
-            (
-                "numeric",
-                numeric_pipeline,
-                numeric
-            ),
-            (
-                "categorical",
-                categorical_pipeline,
-                categorical
-            ),
-        ]
-    )
+def make_preprocessor(numeric, categorical):
+    num = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scale", StandardScaler()),
+    ])
+    cat = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+    ])
+    return ColumnTransformer([
+        ("num", num, numeric),
+        ("cat", cat, categorical),
+    ])
 
 
-# ============================================================
-# AI MODELS
-# ============================================================
-
-def create_models(seed, mode):
-
-    n_estimators = (
-        200
-        if mode == "quick"
-        else 350
-    )
-
-    learning_rate = (
-        0.06
-        if mode == "quick"
-        else 0.04
-    )
+def make_models(seed: int, threads: int, mode: str):
+    trees = 160 if mode == "quick" else 260
+    lr = 0.055 if mode == "quick" else 0.04
 
     return {
-
-        "LogisticRegression":
-            LogisticRegression(
-                max_iter=3000,
-                class_weight="balanced",
-                random_state=seed
-            ),
-
-        "RandomForest":
-            RandomForestClassifier(
-                n_estimators=n_estimators,
-                min_samples_leaf=2,
-                class_weight="balanced_subsample",
-                random_state=seed,
-                n_jobs=-1
-            ),
-
-        "XGBoost":
-            XGBClassifier(
-                n_estimators=n_estimators,
-                max_depth=4,
-                learning_rate=learning_rate,
-                subsample=0.90,
-                colsample_bytree=0.90,
-                objective="binary:logistic",
-                eval_metric="logloss",
-                tree_method="hist",
-                random_state=seed,
-                n_jobs=-1
-            ),
-
-        "LightGBM":
-            LGBMClassifier(
-                n_estimators=n_estimators,
-                learning_rate=learning_rate,
-                num_leaves=31,
-                subsample=0.90,
-                colsample_bytree=0.90,
-                class_weight="balanced",
-                random_state=seed,
-                verbosity=-1,
-                n_jobs=-1
-            ),
+        "LogisticRegression": LogisticRegression(
+            max_iter=2500,
+            class_weight="balanced",
+            random_state=seed,
+        ),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=trees,
+            min_samples_leaf=2,
+            max_features="sqrt",
+            class_weight="balanced_subsample",
+            random_state=seed,
+            n_jobs=threads,
+        ),
+        "XGBoost": XGBClassifier(
+            n_estimators=trees,
+            max_depth=4,
+            learning_rate=lr,
+            subsample=0.90,
+            colsample_bytree=0.90,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            random_state=seed,
+            n_jobs=threads,
+        ),
+        "LightGBM": LGBMClassifier(
+            n_estimators=trees,
+            learning_rate=lr,
+            num_leaves=31,
+            subsample=0.90,
+            colsample_bytree=0.90,
+            class_weight="balanced",
+            random_state=seed,
+            verbosity=-1,
+            n_jobs=threads,
+        ),
     }
 
 
-# ============================================================
-# AI METRICS
-# ============================================================
+class PlattScaler:
+    """Leakage-safe sigmoid calibrator fitted only on a calibration partition."""
+    def __init__(self):
+        self.model = LogisticRegression(max_iter=1000)
 
-def expected_calibration_error(
-    y_true,
-    probabilities,
-    bins=10
+    @staticmethod
+    def _logit(p):
+        p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)
+        return np.log(p / (1 - p)).reshape(-1, 1)
+
+    def fit(self, raw_probability, y):
+        self.model.fit(self._logit(raw_probability), np.asarray(y))
+        return self
+
+    def predict(self, raw_probability):
+        return self.model.predict_proba(self._logit(raw_probability))[:, 1]
+
+
+def fit_calibrated_model(
+    model,
+    preprocessor,
+    X_train,
+    y_train,
+    X_test,
+    seed,
 ):
-
-    boundaries = np.linspace(
-        0,
-        1,
-        bins + 1
+    fit_idx, cal_idx = train_test_split(
+        np.arange(len(X_train)),
+        test_size=0.20,
+        random_state=seed,
+        stratify=y_train,
     )
 
-    result = 0.0
+    pipeline = Pipeline([
+        ("preprocess", clone(preprocessor)),
+        ("model", clone(model)),
+    ])
 
-    for low, high in zip(
-        boundaries[:-1],
-        boundaries[1:]
-    ):
+    pipeline.fit(X_train.iloc[fit_idx], y_train.iloc[fit_idx])
 
-        if high == 1:
-            mask = (
-                (probabilities >= low)
-                & (probabilities <= high)
-            )
-        else:
-            mask = (
-                (probabilities >= low)
-                & (probabilities < high)
-            )
+    raw_cal = pipeline.predict_proba(X_train.iloc[cal_idx])[:, 1]
+    raw_test = pipeline.predict_proba(X_test)[:, 1]
 
+    scaler = PlattScaler().fit(raw_cal, y_train.iloc[cal_idx])
+    calibrated_test = scaler.predict(raw_test)
+    return np.clip(calibrated_test, 1e-6, 1 - 1e-6)
+
+
+def expected_calibration_error(y_true, p, bins=10):
+    y_true = np.asarray(y_true)
+    p = np.asarray(p)
+    edges = np.linspace(0, 1, bins + 1)
+    ece = 0.0
+
+    for i in range(bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (p >= lo) & (p <= hi if i == bins - 1 else p < hi)
         if not np.any(mask):
             continue
-
-        observed = np.mean(
-            y_true[mask]
-        )
-
-        confidence = np.mean(
-            probabilities[mask]
-        )
-
-        result += (
-            np.mean(mask)
-            * abs(
-                observed
-                - confidence
-            )
-        )
-
-    return float(result)
+        ece += np.mean(mask) * abs(np.mean(y_true[mask]) - np.mean(p[mask]))
+    return float(ece)
 
 
-def predictive_uncertainty(probabilities):
-
-    probabilities = np.clip(
-        probabilities,
-        1e-12,
-        1 - 1e-12
-    )
-
-    # Binary entropy.
-    # Maximum value = 1 at p = 0.5.
-    uncertainty = -(
-        probabilities
-        * np.log2(probabilities)
-        +
-        (1 - probabilities)
-        * np.log2(
-            1 - probabilities
-        )
-    )
-
-    return uncertainty
-
-
-def model_metrics(
-    y_true,
-    probabilities
-):
-
-    predictions = (
-        probabilities >= 0.5
-    ).astype(int)
-
+def predictive_metrics(y, p):
+    pred = (p >= 0.5).astype(int)
     return {
-
-        "roc_auc":
-            roc_auc_score(
-                y_true,
-                probabilities
-            ),
-
-        "pr_auc":
-            average_precision_score(
-                y_true,
-                probabilities
-            ),
-
-        "accuracy":
-            accuracy_score(
-                y_true,
-                predictions
-            ),
-
-        "precision":
-            precision_score(
-                y_true,
-                predictions,
-                zero_division=0
-            ),
-
-        "recall":
-            recall_score(
-                y_true,
-                predictions,
-                zero_division=0
-            ),
-
-        "f1":
-            f1_score(
-                y_true,
-                predictions,
-                zero_division=0
-            ),
-
-        "brier":
-            brier_score_loss(
-                y_true,
-                probabilities
-            ),
-
-        "log_loss":
-            log_loss(
-                y_true,
-                probabilities
-            ),
-
-        "ece":
-            expected_calibration_error(
-                y_true,
-                probabilities
-            ),
+        "roc_auc": float(roc_auc_score(y, p)),
+        "pr_auc": float(average_precision_score(y, p)),
+        "accuracy": float(accuracy_score(y, pred)),
+        "precision": float(precision_score(y, pred, zero_division=0)),
+        "recall": float(recall_score(y, pred, zero_division=0)),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "brier": float(brier_score_loss(y, p)),
+        "log_loss": float(log_loss(y, p)),
+        "ece": float(expected_calibration_error(y, p)),
     }
 
 
-# ============================================================
-# BUDGET ALLOCATION
-# ============================================================
+def binary_entropy(p):
+    p = np.clip(np.asarray(p, dtype=float), 1e-12, 1 - 1e-12)
+    return -(p * np.log2(p) + (1 - p) * np.log2(1 - p))
 
-def allocate_budget(
-    candidates,
-    priority,
-    costs,
-    budget,
-    action_name
-):
 
-    actions = np.array(
-        ["No Action"] * len(priority),
-        dtype=object
+def composite_uncertainty(model_probabilities):
+    """
+    model_probabilities: shape [n_models, n_customers]
+    Entropy captures closeness to 0.5.
+    Disagreement captures model-to-model dispersion.
+    Both are normalized to approximately [0,1].
+    """
+    probs = np.asarray(model_probabilities, dtype=float)
+    mean_p = probs.mean(axis=0)
+    entropy = binary_entropy(mean_p)
+    disagreement = np.clip(2.0 * probs.std(axis=0), 0.0, 1.0)
+    uncertainty = np.clip(0.70 * entropy + 0.30 * disagreement, 0.0, 1.0)
+    return mean_p, uncertainty, entropy, disagreement
+
+
+def percentile_rank(values):
+    s = pd.Series(values)
+    return s.rank(method="average", pct=True).to_numpy(dtype=float)
+
+
+def business_vectors(d, cfg: BusinessConfig):
+    p = d["churn_probability"].to_numpy(float)
+    uncertainty = d["uncertainty"].to_numpy(float)
+    cltv_pct = d["cltv_percentile"].to_numpy(float)
+    annual_value = d["annual_margin_value"].to_numpy(float)
+
+    offer_utility = p * cfg.retention_success * annual_value - cfg.offer_cost
+
+    expected_review_offer_probability = (
+        p * cfg.human_accuracy
+        + (1 - p) * (1 - cfg.human_accuracy)
     )
-
-    indices = np.where(
-        candidates
-    )[0]
-
-    ordered = indices[
-        np.argsort(
-            -priority[indices]
-        )
-    ]
-
-    spent = 0.0
-
-    for i in ordered:
-
-        cost = float(
-            costs[i]
-        )
-
-        if (
-            spent + cost
-            <= budget
-        ):
-
-            actions[i] = (
-                action_name
-            )
-
-            spent += cost
-
-    return actions
-
-
-# ============================================================
-# BASELINE DECISION STRATEGIES
-# ============================================================
-
-def threshold_strategy(
-    d,
-    cfg,
-    budget
-):
-
-    p = d[
-        "churn_probability"
-    ].to_numpy()
-
-    costs = np.full(
-        len(d),
-        cfg.offer_cost
-    )
-
-    return allocate_budget(
-        p >= 0.50,
-        p,
-        costs,
-        budget,
-        "Retention Offer"
-    )
-
-
-def top_risk_strategy(
-    d,
-    cfg,
-    budget
-):
-
-    p = d[
-        "churn_probability"
-    ].to_numpy()
-
-    number = max(
-        1,
-        int(
-            math.ceil(
-                len(d)
-                * cfg.top_risk_fraction
-            )
-        )
-    )
-
-    selected = np.argsort(
-        -p
-    )[:number]
-
-    mask = np.zeros(
-        len(d),
-        dtype=bool
-    )
-
-    mask[selected] = True
-
-    costs = np.full(
-        len(d),
-        cfg.offer_cost
-    )
-
-    return allocate_budget(
-        mask,
-        p,
-        costs,
-        budget,
-        "Retention Offer"
-    )
-
-
-def cost_aware_strategy(
-    d,
-    cfg,
-    budget
-):
-
-    p = d[
-        "churn_probability"
-    ].to_numpy()
-
-    cltv = d[
-        "CLTV"
-    ].to_numpy()
-
-    utility = (
-        p
-        * cfg.retention_success
-        * cltv
-        - cfg.offer_cost
-    )
-
-    candidates = (
-        utility > 0
-    )
-
-    costs = np.full(
-        len(d),
-        cfg.offer_cost
-    )
-
-    return allocate_budget(
-        candidates,
-        utility,
-        costs,
-        budget,
-        "Retention Offer"
-    )
-
-
-# ============================================================
-# PROPOSED KNOWLEDGE-GUIDED DECISION INTELLIGENCE
-# ============================================================
-
-def kgdi_strategy(
-    d,
-    cfg,
-    budget,
-    high_value_threshold
-):
-
-    p = d[
-        "churn_probability"
-    ].to_numpy(
-        dtype=float
-    )
-
-    uncertainty = d[
-        "uncertainty"
-    ].to_numpy(
-        dtype=float
-    )
-
-    cltv = d[
-        "CLTV"
-    ].to_numpy(
-        dtype=float
-    )
-
-    # Expected utility from sending
-    # a retention offer.
-    offer_utility = (
-        p
-        * cfg.retention_success
-        * cltv
-        - cfg.offer_cost
-        -
-        cfg.uncertainty_penalty
-        * uncertainty
-        * cfg.retention_success
-        * cltv
-    )
-
-    # Expected review cost assumes that
-    # some reviewed cases will subsequently
-    # receive a retention offer.
-    review_cost = (
+    review_expected_cost = (
         cfg.human_review_cost
-        +
-        p
-        * cfg.human_accuracy
-        * cfg.offer_cost
+        + cfg.offer_cost * expected_review_offer_probability
     )
-
     review_utility = (
-        p
-        * cfg.human_accuracy
-        * cfg.retention_success
-        * cltv
-        - review_cost
-        -
-        0.5
-        * cfg.uncertainty_penalty
-        * uncertainty
-        * cfg.retention_success
-        * cltv
+        p * cfg.human_accuracy * cfg.retention_success * annual_value
+        - review_expected_cost
     )
 
-    # KNOWLEDGE RULE:
-    # High-value + uncertain + meaningful
-    # churn risk -> Human Review.
-    review_mask = (
-        (p >= cfg.minimum_churn_risk)
-        &
-        (
-            uncertainty
-            >= cfg.uncertainty_threshold
-        )
-        &
-        (
-            cltv
-            >= high_value_threshold
-        )
-        &
-        (
-            review_utility > 0
-        )
-    )
+    return {
+        "p": p,
+        "uncertainty": uncertainty,
+        "cltv_pct": cltv_pct,
+        "annual_value": annual_value,
+        "offer_utility": offer_utility,
+        "review_utility": review_utility,
+        "review_expected_cost": review_expected_cost,
+    }
 
-    # Lower uncertainty or lower-value
-    # profitable cases receive direct offers.
-    offer_mask = (
-        (p >= cfg.minimum_churn_risk)
-        &
-        (~review_mask)
-        &
-        (
-            offer_utility > 0
-        )
-    )
 
-    actions = np.array(
-        ["No Action"] * len(d),
-        dtype=object
+def allocate_mixed(candidates, budget):
+    """
+    candidates: list of (index, action, priority, expected_cost)
+    Greedy utility-per-cost allocation under a common budget.
+    """
+    actions = {}
+    ranked = sorted(
+        candidates,
+        key=lambda x: (x[2] / max(x[3], 1e-9), x[2]),
+        reverse=True,
     )
+    spent = 0.0
+    for idx, action, priority, expected_cost in ranked:
+        if priority <= 0:
+            continue
+        if spent + expected_cost <= budget:
+            actions[idx] = action
+            spent += expected_cost
+    return actions, spent
 
+
+def finalize_actions(n, mapping):
+    result = np.array(["No Action"] * n, dtype=object)
+    for idx, action in mapping.items():
+        result[idx] = action
+    return result
+
+
+def policy_probability_threshold(d, cfg, budget):
+    v = business_vectors(d, cfg)
+    candidates = [
+        (i, "Retention Offer", float(v["p"][i]), float(cfg.offer_cost))
+        for i in range(len(d))
+        if v["p"][i] >= 0.50
+    ]
+    selected, _ = allocate_mixed(candidates, budget)
+    return finalize_actions(len(d), selected)
+
+
+def policy_cost_aware(d, cfg, budget):
+    v = business_vectors(d, cfg)
+    candidates = [
+        (i, "Retention Offer", float(v["offer_utility"][i]), float(cfg.offer_cost))
+        for i in range(len(d))
+        if v["p"][i] >= cfg.minimum_churn_risk and v["offer_utility"][i] > 0
+    ]
+    selected, _ = allocate_mixed(candidates, budget)
+    return finalize_actions(len(d), selected)
+
+
+def policy_uncertainty_review(d, cfg, budget):
+    v = business_vectors(d, cfg)
     candidates = []
 
-    for i in np.where(
-        review_mask
-    )[0]:
-
-        candidates.append(
-            (
-                i,
-                "Human Review",
-                float(
-                    review_utility[i]
-                ),
-                float(
-                    review_cost[i]
-                ),
-            )
-        )
-
-    for i in np.where(
-        offer_mask
-    )[0]:
-
-        candidates.append(
-            (
-                i,
-                "Retention Offer",
-                float(
-                    offer_utility[i]
-                ),
-                float(
-                    cfg.offer_cost
-                ),
-            )
-        )
-
-    candidates.sort(
-        key=lambda x: x[2],
-        reverse=True
-    )
-
-    spent = 0.0
-
-    for (
-        index,
-        action,
-        utility,
-        cost
-    ) in candidates:
+    for i in range(len(d)):
+        if v["p"][i] < cfg.minimum_churn_risk:
+            continue
 
         if (
-            spent + cost
-            <= budget
+            v["uncertainty"][i] >= cfg.uncertainty_threshold
+            and v["review_utility"][i] > 0
         ):
+            candidates.append((
+                i, "Human Review",
+                float(v["review_utility"][i]),
+                float(v["review_expected_cost"][i]),
+            ))
+        elif v["offer_utility"][i] > 0:
+            candidates.append((
+                i, "Retention Offer",
+                float(v["offer_utility"][i]),
+                float(cfg.offer_cost),
+            ))
 
-            actions[index] = (
-                action
-            )
-
-            spent += cost
-
-    return actions
+    selected, _ = allocate_mixed(candidates, budget)
+    return finalize_actions(len(d), selected)
 
 
-# ============================================================
-# BUSINESS EVALUATION
-# ============================================================
-
-def evaluate_decisions(
+def policy_kgdi(
     d,
-    actions,
-    cfg
+    cfg,
+    budget,
+    use_uncertainty=True,
+    use_cltv=True,
+    use_human_review=True,
 ):
+    """
+    Proposed KGDI:
+    - economic eligibility from expected utility;
+    - uncertainty routes ambiguous cases to human review;
+    - high-value CLTV index adds strategic priority but never becomes currency;
+    - same intervention budget as all baselines.
+    """
+    v = business_vectors(d, cfg)
+    candidates = []
 
-    y = d[TARGET].to_numpy(
-        dtype=int
+    for i in range(len(d)):
+        if v["p"][i] < cfg.minimum_churn_risk:
+            continue
+
+        high_value = v["cltv_pct"][i] >= cfg.high_value_quantile
+
+        # Standard uncertainty routing is retained. For strategically high-value
+        # customers, a moderate-uncertainty case may also be reviewed, but only
+        # when its predicted review utility is close to the direct-offer utility.
+        # This prevents CLTV knowledge from overriding the economic objective.
+        standard_uncertain = v["uncertainty"][i] >= cfg.uncertainty_threshold
+        value_sensitive_review = (
+            high_value
+            and v["uncertainty"][i] >= cfg.moderate_uncertainty_threshold
+            and v["review_utility"][i] > 0
+            and (
+                v["offer_utility"][i] <= 0
+                or v["review_utility"][i]
+                >= cfg.review_utility_tolerance * v["offer_utility"][i]
+            )
+        )
+
+        route_review = (
+            use_human_review
+            and use_uncertainty
+            and (standard_uncertain or value_sensitive_review)
+        )
+
+        if route_review and v["review_utility"][i] > 0:
+            base_utility = float(v["review_utility"][i])
+            expected_cost = float(v["review_expected_cost"][i])
+            action = "Human Review"
+        elif v["offer_utility"][i] > 0:
+            base_utility = float(v["offer_utility"][i])
+            expected_cost = float(cfg.offer_cost)
+            action = "Retention Offer"
+        else:
+            continue
+
+        priority = base_utility
+        if use_cltv:
+            priority *= 1.0 + cfg.cltv_priority_weight * float(v["cltv_pct"][i])
+
+        candidates.append((i, action, priority, expected_cost))
+
+    selected, _ = allocate_mixed(candidates, budget)
+    return finalize_actions(len(d), selected)
+
+
+def customer_contributions(d, actions, cfg):
+    y = d[TARGET].to_numpy(int)
+    cltv_pct = d["cltv_percentile"].to_numpy(float)
+    annual_value = d["annual_margin_value"].to_numpy(float)
+
+    offer = actions == "Retention Offer"
+    review = actions == "Human Review"
+    intervention = offer | review
+
+    cost = np.zeros(len(d), dtype=float)
+    saved = np.zeros(len(d), dtype=float)
+
+    # Direct retention offer.
+    cost[offer] = cfg.offer_cost
+    saved[offer] = (
+        y[offer] * cfg.retention_success * annual_value[offer]
     )
 
-    p = d[
-        "churn_probability"
-    ].to_numpy(
-        dtype=float
+    # Human-review path.
+    # If true churner: correct positive with probability accuracy.
+    # If non-churner: false positive with probability (1-accuracy).
+    review_offer_prob = (
+        y[review] * cfg.human_accuracy
+        + (1 - y[review]) * (1 - cfg.human_accuracy)
     )
-
-    cltv = d[
-        "CLTV"
-    ].to_numpy(
-        dtype=float
+    cost[review] = (
+        cfg.human_review_cost
+        + cfg.offer_cost * review_offer_prob
     )
-
-    offer = (
-        actions
-        == "Retention Offer"
-    )
-
-    review = (
-        actions
-        == "Human Review"
-    )
-
-    intervened = (
-        offer | review
-    )
-
-    expected_review_followups = (
-        p[review]
+    saved[review] = (
+        y[review]
         * cfg.human_accuracy
-    ).sum()
-
-    total_cost = (
-        offer.sum()
-        * cfg.offer_cost
-
-        +
-
-        review.sum()
-        * cfg.human_review_cost
-
-        +
-
-        expected_review_followups
-        * cfg.offer_cost
+        * cfg.retention_success
+        * annual_value[review]
     )
 
-    expected_saved_value = (
+    net = saved - cost
 
-        np.sum(
-            p[offer]
-            * cfg.retention_success
-            * cltv[offer]
-        )
+    return pd.DataFrame({
+        "cost": cost,
+        "saved_value": saved,
+        "net_benefit": net,
+        "intervened": intervention.astype(int),
+        "true_churn": y,
+        "high_value_churn": (
+            (y == 1) & (cltv_pct >= cfg.high_value_quantile)
+        ).astype(int),
+        "false_offer": ((y == 0) & offer).astype(int),
+    })
 
-        +
 
-        np.sum(
-            p[review]
-            * cfg.human_accuracy
-            * cfg.retention_success
-            * cltv[review]
-        )
+def evaluate_policy(d, actions, cfg):
+    c = customer_contributions(d, actions, cfg)
+    total_churn = int(c["true_churn"].sum())
+    high_value_churn = int(c["high_value_churn"].sum())
+
+    reached_churn = int(
+        ((c["true_churn"] == 1) & (c["intervened"] == 1)).sum()
     )
-
-    expected_utility = (
-        expected_saved_value
-        - total_cost
+    reached_high = int(
+        ((c["high_value_churn"] == 1) & (c["intervened"] == 1)).sum()
     )
-
-    # This uses observed churn outcomes
-    # only as an evaluation anchor.
-    # It remains a simulated utility proxy.
-    outcome_saved_value = (
-
-        np.sum(
-            y[offer]
-            * cfg.retention_success
-            * cltv[offer]
-        )
-
-        +
-
-        np.sum(
-            y[review]
-            * cfg.human_accuracy
-            * cfg.retention_success
-            * cltv[review]
-        )
-    )
-
-    outcome_utility = (
-        outcome_saved_value
-        - total_cost
-    )
-
-    total_churners = (
-        y == 1
-    ).sum()
-
-    churners_reached = (
-        (y == 1)
-        & intervened
-    ).sum()
-
-    unnecessary_offers = (
-        (y == 0)
-        & offer
-    ).sum()
-
-    high_value_threshold = (
-        np.quantile(
-            cltv,
-            0.75
-        )
-    )
-
-    high_value_churners = (
-        (y == 1)
-        &
-        (
-            cltv
-            >= high_value_threshold
-        )
-    )
-
-    hv_total = (
-        high_value_churners.sum()
-    )
-
-    hv_reached = (
-        high_value_churners
-        & intervened
-    ).sum()
 
     return {
-
-        "offers":
-            int(offer.sum()),
-
-        "human_reviews":
-            int(review.sum()),
-
-        "interventions":
-            int(intervened.sum()),
-
-        "intervention_rate":
-            float(
-                intervened.mean()
-            ),
-
-        "churn_reach_rate":
-            float(
-                churners_reached
-                / total_churners
-            )
-            if total_churners
-            else np.nan,
-
-        "high_value_churn_reach_rate":
-            float(
-                hv_reached
-                / hv_total
-            )
-            if hv_total
-            else np.nan,
-
-        "total_expected_cost":
-            float(total_cost),
-
-        "expected_utility":
-            float(expected_utility),
-
-        "outcome_utility_proxy":
-            float(outcome_utility),
-
-        "unnecessary_offer_cost":
-            float(
-                unnecessary_offers
-                * cfg.offer_cost
-            ),
-
-        "mean_cltv_intervened":
-            float(
-                cltv[
-                    intervened
-                ].mean()
-            )
-            if intervened.any()
-            else 0.0,
+        "offers": int(np.sum(actions == "Retention Offer")),
+        "human_reviews": int(np.sum(actions == "Human Review")),
+        "interventions": int(c["intervened"].sum()),
+        "intervention_rate": float(c["intervened"].mean()),
+        "churn_reach_rate": reached_churn / total_churn if total_churn else np.nan,
+        "high_value_churn_reach_rate": (
+            reached_high / high_value_churn if high_value_churn else np.nan
+        ),
+        "total_cost": float(c["cost"].sum()),
+        "saved_value_proxy": float(c["saved_value"].sum()),
+        "net_benefit_proxy": float(c["net_benefit"].sum()),
+        "unnecessary_offer_cost": float(c["false_offer"].sum() * cfg.offer_cost),
     }
 
 
-# ============================================================
-# RESULT SUMMARY
-# ============================================================
+def bootstrap_delta(d, actions_a, actions_b, cfg, n_boot, seed):
+    """
+    Paired customer bootstrap conditional on the already-selected policies.
+    Repeated CV separately captures model/policy instability.
+    """
+    ca = customer_contributions(d, actions_a, cfg)["net_benefit"].to_numpy()
+    cb = customer_contributions(d, actions_b, cfg)["net_benefit"].to_numpy()
+    delta = ca - cb
 
-def summarize(
-    df,
-    groups,
-    metrics
-):
+    rng = np.random.default_rng(seed)
+    n = len(delta)
+    stats = np.empty(n_boot, dtype=float)
 
-    output = []
+    for b in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        stats[b] = delta[idx].sum()
 
-    grouped = df.groupby(
-        groups,
-        dropna=False
+    return {
+        "delta_mean": float(delta.sum()),
+        "ci_low": float(np.percentile(stats, 2.5)),
+        "ci_high": float(np.percentile(stats, 97.5)),
+        "bootstrap_probability_gt_0": float(np.mean(stats > 0)),
+    }
+
+
+def mean_sd_string(values, digits=3):
+    v = np.asarray(values, dtype=float)
+    if len(v) <= 1:
+        return f"{v.mean():.{digits}f}"
+    return f"{v.mean():.{digits}f} ± {v.std(ddof=1):.{digits}f}"
+
+
+def run_repeated_oof(df, features, numeric, categorical, args):
+    repeats = args.repeats if args.repeats is not None else (1 if args.mode == "quick" else 5)
+    splitter = RepeatedStratifiedKFold(
+        n_splits=args.folds,
+        n_repeats=repeats,
+        random_state=args.seed,
     )
 
-    for keys, group in grouped:
+    X = df[features].reset_index(drop=True)
+    y = df[TARGET].astype(int).reset_index(drop=True)
+    n = len(df)
 
-        if not isinstance(
-            keys,
-            tuple
-        ):
-            keys = (keys,)
+    preprocessor = make_preprocessor(numeric, categorical)
 
-        row = dict(
-            zip(
-                groups,
-                keys
-            )
+    # repeat -> model -> probability array
+    repeat_predictions = {
+        r: {
+            name: np.full(n, np.nan)
+            for name in make_models(args.seed, args.threads, args.mode).keys()
+        }
+        for r in range(repeats)
+    }
+
+    fold_rows = []
+
+    for split_number, (train_idx, test_idx) in enumerate(splitter.split(X, y)):
+        repeat_id = split_number // args.folds
+        fold_id = split_number % args.folds
+
+        X_train = X.iloc[train_idx].reset_index(drop=True)
+        y_train = y.iloc[train_idx].reset_index(drop=True)
+        X_test = X.iloc[test_idx]
+
+        models = make_models(
+            seed=args.seed + repeat_id * 100 + fold_id,
+            threads=args.threads,
+            mode=args.mode,
         )
 
-        for metric in metrics:
-
-            values = pd.to_numeric(
-                group[metric],
-                errors="coerce"
+        for model_name, model in models.items():
+            p_test = fit_calibrated_model(
+                model=model,
+                preprocessor=preprocessor,
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                seed=args.seed + repeat_id * 1000 + fold_id * 10,
             )
+            repeat_predictions[repeat_id][model_name][test_idx] = p_test
 
-            row[
-                f"{metric}_mean"
-            ] = float(
-                values.mean()
-            )
+        print(
+            f"Completed repeat {repeat_id + 1}/{repeats}, "
+            f"fold {fold_id + 1}/{args.folds}"
+        )
 
-            row[
-                f"{metric}_std"
-            ] = (
-                float(
-                    values.std(
-                        ddof=1
-                    )
+    # Validate complete OOF coverage and build per-repeat metrics.
+    per_repeat_model_rows = []
+    ensemble_by_repeat = {}
+
+    for repeat_id in range(repeats):
+        model_matrix = []
+        for model_name, probs in repeat_predictions[repeat_id].items():
+            if np.isnan(probs).any():
+                raise RuntimeError(
+                    f"Incomplete OOF predictions: repeat={repeat_id}, model={model_name}"
                 )
-                if len(values) > 1
-                else 0.0
-            )
+            row = {"repeat": repeat_id + 1, "model": model_name}
+            row.update(predictive_metrics(y.to_numpy(), probs))
+            per_repeat_model_rows.append(row)
+            model_matrix.append(probs)
 
-        output.append(row)
+        model_matrix = np.vstack(model_matrix)
+        ensemble_p, uncertainty, entropy, disagreement = composite_uncertainty(model_matrix)
+        ensemble_by_repeat[repeat_id] = {
+            "probability": ensemble_p,
+            "uncertainty": uncertainty,
+            "entropy": entropy,
+            "disagreement": disagreement,
+            "model_matrix": model_matrix,
+        }
 
-    return pd.DataFrame(
-        output
+        row = {"repeat": repeat_id + 1, "model": "Ensemble"}
+        row.update(predictive_metrics(y.to_numpy(), ensemble_p))
+        per_repeat_model_rows.append(row)
+
+    return (
+        pd.DataFrame(per_repeat_model_rows),
+        ensemble_by_repeat,
+        repeat_predictions,
     )
 
 
-# ============================================================
-# STATISTICAL TESTS
-# ============================================================
+def build_decision_table(df, ensemble_info, cfg):
+    d = pd.DataFrame({
+        "CustomerID": df["CustomerID"].astype(str).values,
+        TARGET: df[TARGET].astype(int).values,
+        "churn_probability": ensemble_info["probability"],
+        "uncertainty": ensemble_info["uncertainty"],
+        "entropy": ensemble_info["entropy"],
+        "model_disagreement": ensemble_info["disagreement"],
+        "CLTV": df["CLTV"].astype(float).values,
+        "cltv_percentile": percentile_rank(df["CLTV"].astype(float).values),
+        "Monthly Charges": df["Monthly Charges"].astype(float).values,
+        "Tenure Months": df["Tenure Months"].astype(float).values,
+    })
 
-def statistical_tests(
-    results
-):
-
-    pivot = (
-        results
-        .pivot_table(
-            index=[
-                "seed",
-                "model"
-            ],
-            columns="strategy",
-            values="outcome_utility_proxy",
-            aggfunc="mean"
-        )
+    d["annual_margin_value"] = (
+        d["Monthly Charges"]
+        * cfg.value_horizon_months
+        * cfg.gross_margin_rate
     )
+    return d
 
-    if (
-        "Proposed_KGDI"
-        not in pivot.columns
-    ):
+
+def run_decision_experiment(df, ensemble_by_repeat, cfg):
+    all_rows = []
+    decision_tables = {}
+
+    for repeat_id, info in ensemble_by_repeat.items():
+        d = build_decision_table(df, info, cfg)
+        budget = len(d) * cfg.offer_cost * cfg.budget_fraction
+
+        policies = {
+            "Probability_Threshold": policy_probability_threshold(d, cfg, budget),
+            "Cost_Aware": policy_cost_aware(d, cfg, budget),
+            "Uncertainty_Review": policy_uncertainty_review(d, cfg, budget),
+            "Proposed_KGDI": policy_kgdi(d, cfg, budget),
+        }
+
+        for name, actions in policies.items():
+            row = {
+                "repeat": repeat_id + 1,
+                "strategy": name,
+                "budget": float(budget),
+            }
+            row.update(evaluate_policy(d, actions, cfg))
+            all_rows.append(row)
+            d[f"action_{name}"] = actions
+
+        decision_tables[repeat_id] = d
+
+    return pd.DataFrame(all_rows), decision_tables
+
+
+def repeated_significance_tests(decision_metrics):
+    out = []
+    pivot = decision_metrics.pivot(
+        index="repeat",
+        columns="strategy",
+        values="net_benefit_proxy",
+    )
+    if "Proposed_KGDI" not in pivot.columns:
         return pd.DataFrame()
 
-    output = []
-
-    proposed = pivot[
-        "Proposed_KGDI"
-    ]
-
-    for baseline in pivot.columns:
-
-        if (
-            baseline
-            == "Proposed_KGDI"
-        ):
+    for baseline in [
+        "Probability_Threshold",
+        "Cost_Aware",
+        "Uncertainty_Review",
+    ]:
+        if baseline not in pivot.columns:
             continue
+        diff = (pivot["Proposed_KGDI"] - pivot[baseline]).dropna()
 
-        paired = pd.concat(
-            [
-                proposed,
-                pivot[baseline]
-            ],
-            axis=1
-        ).dropna()
+        if len(diff) < 3 or np.allclose(diff, 0):
+            stat, pvalue = np.nan, np.nan
+        else:
+            try:
+                stat, pvalue = wilcoxon(diff, alternative="greater")
+            except ValueError:
+                stat, pvalue = np.nan, np.nan
 
-        if len(paired) < 2:
-            continue
-
-        difference = (
-            paired.iloc[:, 0]
-            - paired.iloc[:, 1]
-        )
-
-        try:
-
-            statistic, pvalue = (
-                wilcoxon(
-                    difference,
-                    alternative="greater"
-                )
-            )
-
-        except ValueError:
-
-            statistic = np.nan
-            pvalue = np.nan
-
-        output.append(
-            {
-                "comparison":
-                    f"Proposed_KGDI > {baseline}",
-
-                "pairs":
-                    len(paired),
-
-                "mean_difference":
-                    difference.mean(),
-
-                "median_difference":
-                    difference.median(),
-
-                "wilcoxon_statistic":
-                    statistic,
-
-                "one_sided_p_value":
-                    pvalue,
-            }
-        )
-
-    return pd.DataFrame(
-        output
-    )
+        out.append({
+            "comparison": f"Proposed_KGDI > {baseline}",
+            "repeats": int(len(diff)),
+            "mean_delta_net_benefit": float(diff.mean()),
+            "median_delta_net_benefit": float(diff.median()),
+            "wilcoxon_statistic": stat,
+            "one_sided_p_value": pvalue,
+        })
+    return pd.DataFrame(out)
 
 
-# ============================================================
-# SENSITIVITY ANALYSIS
-# ============================================================
+def run_ablations(d, cfg):
+    budget = len(d) * cfg.offer_cost * cfg.budget_fraction
+    variants = {
+        "Full_KGDI": policy_kgdi(d, cfg, budget, True, True, True),
+        "No_Uncertainty": policy_kgdi(d, cfg, budget, False, True, True),
+        "No_CLTV_Priority": policy_kgdi(d, cfg, budget, True, False, True),
+        "No_Human_Review": policy_kgdi(d, cfg, budget, True, True, False),
+    }
+    rows = []
+    for name, actions in variants.items():
+        row = {"variant": name}
+        row.update(evaluate_policy(d, actions, cfg))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
-def sensitivity_analysis(
-    decision_tables,
-    base_config
-):
 
-    offer_costs = [
-        50.0,
-        100.0,
-        150.0
-    ]
-
-    success_rates = [
-        0.20,
-        0.35,
-        0.50
-    ]
-
-    budget_fractions = [
-        0.10,
-        0.20,
-        0.30
-    ]
+def subgroup_audit(df, d, actions):
+    audit = pd.DataFrame({
+        "Gender": df["Gender"].astype(str).values if "Gender" in df else "Unknown",
+        "Senior Citizen": (
+            df["Senior Citizen"].astype(str).values
+            if "Senior Citizen" in df else "Unknown"
+        ),
+        TARGET: d[TARGET].values,
+        "intervened": (actions != "No Action").astype(int),
+    })
 
     rows = []
-
-    for (
-        seed,
-        model_name,
-        d,
-        high_value_threshold
-    ) in decision_tables:
-
-        for offer_cost in offer_costs:
-
-            for success in success_rates:
-
-                for budget_fraction in budget_fractions:
-
-                    cfg = BusinessConfig(
-                        **asdict(
-                            base_config
-                        )
-                    )
-
-                    cfg.offer_cost = (
-                        offer_cost
-                    )
-
-                    cfg.retention_success = (
-                        success
-                    )
-
-                    cfg.budget_fraction = (
-                        budget_fraction
-                    )
-
-                    budget = (
-                        len(d)
-                        * cfg.offer_cost
-                        * cfg.budget_fraction
-                    )
-
-                    strategies = {
-
-                        "Probability_Threshold":
-                            threshold_strategy(
-                                d,
-                                cfg,
-                                budget
-                            ),
-
-                        "Top_Risk":
-                            top_risk_strategy(
-                                d,
-                                cfg,
-                                budget
-                            ),
-
-                        "Cost_Aware":
-                            cost_aware_strategy(
-                                d,
-                                cfg,
-                                budget
-                            ),
-
-                        "Proposed_KGDI":
-                            kgdi_strategy(
-                                d,
-                                cfg,
-                                budget,
-                                high_value_threshold
-                            ),
-                    }
-
-                    for (
-                        strategy_name,
-                        actions
-                    ) in strategies.items():
-
-                        metrics = (
-                            evaluate_decisions(
-                                d,
-                                actions,
-                                cfg
-                            )
-                        )
-
-                        rows.append(
-                            {
-                                "seed":
-                                    seed,
-
-                                "model":
-                                    model_name,
-
-                                "strategy":
-                                    strategy_name,
-
-                                "offer_cost":
-                                    offer_cost,
-
-                                "retention_success":
-                                    success,
-
-                                "budget_fraction":
-                                    budget_fraction,
-
-                                **metrics,
-                            }
-                        )
-
-    return pd.DataFrame(
-        rows
-    )
+    for attribute in ["Gender", "Senior Citizen"]:
+        for group, g in audit.groupby(attribute):
+            churners = g[g[TARGET] == 1]
+            rows.append({
+                "attribute": attribute,
+                "group": group,
+                "n": int(len(g)),
+                "churn_rate": float(g[TARGET].mean()),
+                "intervention_rate": float(g["intervened"].mean()),
+                "churn_reach_rate": (
+                    float(churners["intervened"].mean())
+                    if len(churners) else np.nan
+                ),
+            })
+    return pd.DataFrame(rows)
 
 
-# ============================================================
-# FIGURES
-# ============================================================
+def sensitivity_analysis(d, base_cfg):
+    offer_costs = [50.0, 100.0, 150.0]
+    success_rates = [0.20, 0.35, 0.50]
+    budget_fractions = [0.10, 0.20, 0.30]
 
-def create_figures(
-    model_summary,
-    decision_summary,
-    prediction_file,
-    output_dir
-):
+    rows = []
+    for cost in offer_costs:
+        for success in success_rates:
+            for budget_fraction in budget_fractions:
+                cfg = BusinessConfig(**asdict(base_cfg))
+                cfg.offer_cost = cost
+                cfg.retention_success = success
+                cfg.budget_fraction = budget_fraction
 
-    # MODEL ROC-AUC
-    if not model_summary.empty:
+                budget = len(d) * cfg.offer_cost * cfg.budget_fraction
 
-        chart = model_summary.sort_values(
-            "roc_auc_mean",
-            ascending=False
-        )
+                policies = {
+                    "Cost_Aware": policy_cost_aware(d, cfg, budget),
+                    "Uncertainty_Review": policy_uncertainty_review(d, cfg, budget),
+                    "Proposed_KGDI": policy_kgdi(d, cfg, budget),
+                }
 
-        plt.figure(
-            figsize=(9, 5)
-        )
+                metrics = {
+                    k: evaluate_policy(d, a, cfg)
+                    for k, a in policies.items()
+                }
 
-        plt.bar(
-            chart["model"],
-            chart["roc_auc_mean"]
-        )
+                rows.append({
+                    "offer_cost": cost,
+                    "retention_success": success,
+                    "budget_fraction": budget_fraction,
+                    "kgdi_net_benefit": metrics["Proposed_KGDI"]["net_benefit_proxy"],
+                    "uncertainty_net_benefit": metrics["Uncertainty_Review"]["net_benefit_proxy"],
+                    "costaware_net_benefit": metrics["Cost_Aware"]["net_benefit_proxy"],
+                    "kgdi_delta_vs_uncertainty": (
+                        metrics["Proposed_KGDI"]["net_benefit_proxy"]
+                        - metrics["Uncertainty_Review"]["net_benefit_proxy"]
+                    ),
+                    "kgdi_high_value_churn_reach": (
+                        metrics["Proposed_KGDI"]["high_value_churn_reach_rate"]
+                    ),
+                })
+    return pd.DataFrame(rows)
 
-        plt.ylabel(
-            "Mean ROC-AUC"
-        )
 
-        plt.title(
-            "Calibrated Churn Prediction Performance"
-        )
+def make_table_1(model_metrics):
+    rows = []
+    order = [
+        "LogisticRegression", "RandomForest", "XGBoost", "LightGBM", "Ensemble"
+    ]
+    for model in order:
+        g = model_metrics[model_metrics["model"] == model]
+        if g.empty:
+            continue
+        rows.append({
+            "Model": model,
+            "AUROC": mean_sd_string(g["roc_auc"], 3),
+            "PR-AUC": mean_sd_string(g["pr_auc"], 3),
+            "F1": mean_sd_string(g["f1"], 3),
+            "Brier ↓": mean_sd_string(g["brier"], 3),
+            "ECE ↓": mean_sd_string(g["ece"], 3),
+        })
+    return pd.DataFrame(rows)
 
-        plt.xticks(
-            rotation=20
-        )
 
-        plt.tight_layout()
+def make_table_2(decision_metrics, bootstrap_result):
+    rows = []
+    order = [
+        "Probability_Threshold", "Cost_Aware",
+        "Uncertainty_Review", "Proposed_KGDI"
+    ]
+    base = decision_metrics[
+        decision_metrics["strategy"] == "Uncertainty_Review"
+    ]["net_benefit_proxy"].to_numpy()
 
-        plt.savefig(
-            output_dir
-            / "figure_model_roc_auc.png",
-            dpi=250
-        )
+    for strategy in order:
+        g = decision_metrics[decision_metrics["strategy"] == strategy]
+        if g.empty:
+            continue
 
-        plt.close()
-
-    # DECISION UTILITY
-    if not decision_summary.empty:
-
-        chart = (
-            decision_summary
-            .groupby(
-                "strategy",
-                as_index=False
-            )[
-                "outcome_utility_proxy_mean"
-            ]
-            .mean()
-            .sort_values(
-                "outcome_utility_proxy_mean",
-                ascending=False
+        delta = ""
+        ci = ""
+        if strategy == "Proposed_KGDI":
+            kg = g["net_benefit_proxy"].to_numpy()
+            if len(kg) == len(base):
+                delta = f"{np.mean(kg - base):.2f}"
+            ci = (
+                f"[{bootstrap_result['ci_low']:.2f}, "
+                f"{bootstrap_result['ci_high']:.2f}]"
             )
-        )
 
-        plt.figure(
-            figsize=(10, 5)
-        )
+        rows.append({
+            "Strategy": strategy,
+            "Intervention %": mean_sd_string(100 * g["intervention_rate"], 1),
+            "Churn reach %": mean_sd_string(100 * g["churn_reach_rate"], 1),
+            "High-value churn reach %": mean_sd_string(
+                100 * g["high_value_churn_reach_rate"], 1
+            ),
+            "Net benefit proxy ($)": mean_sd_string(g["net_benefit_proxy"], 2),
+            "Δ vs uncertainty": delta,
+            "95% paired bootstrap CI": ci,
+        })
+    return pd.DataFrame(rows)
 
-        plt.bar(
-            chart["strategy"],
-            chart[
-                "outcome_utility_proxy_mean"
-            ]
-        )
 
-        plt.ylabel(
-            "Outcome-Anchored Utility Proxy"
-        )
+def figure_decision_map(d, actions, output_path):
+    action_order = ["No Action", "Retention Offer", "Human Review"]
+    markers = {"No Action": "o", "Retention Offer": "^", "Human Review": "s"}
 
-        plt.title(
-            "Business Decision Strategy Comparison"
-        )
+    plt.figure(figsize=(8.6, 6.2))
 
-        plt.xticks(
-            rotation=20
-        )
+    # Point size reflects annual margin-value proxy only; no colors are forced.
+    sizes = 12 + 45 * (
+        d["annual_margin_value"].to_numpy()
+        / max(d["annual_margin_value"].max(), 1e-9)
+    )
 
-        plt.tight_layout()
-
-        plt.savefig(
-            output_dir
-            / "figure_decision_utility.png",
-            dpi=250
-        )
-
-        plt.close()
-
-    # RISK-UNCERTAINTY SPACE
-    if (
-        prediction_file
-        and prediction_file.exists()
-    ):
-
-        d = pd.read_csv(
-            prediction_file
-        )
-
-        plt.figure(
-            figsize=(7, 6)
-        )
-
+    for action in action_order:
+        mask = actions == action
+        if not np.any(mask):
+            continue
         plt.scatter(
-            d["churn_probability"],
-            d["uncertainty"],
-            s=12,
-            alpha=0.35
+            d.loc[mask, "churn_probability"],
+            d.loc[mask, "uncertainty"],
+            s=sizes[mask],
+            alpha=0.45,
+            marker=markers[action],
+            label=action,
         )
 
-        plt.xlabel(
-            "Calibrated Churn Probability"
-        )
-
-        plt.ylabel(
-            "Predictive Uncertainty"
-        )
-
-        plt.title(
-            "Risk-Uncertainty Decision Space"
-        )
-
-        plt.tight_layout()
-
-        plt.savefig(
-            output_dir
-            / "figure_risk_uncertainty.png",
-            dpi=250
-        )
-
-        plt.close()
+    plt.xlabel("Calibrated ensemble churn probability")
+    plt.ylabel("Composite predictive uncertainty")
+    plt.title("KGDI Decision Map")
+    plt.legend(frameon=False)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
 
 
-# ============================================================
-# MAIN EXPERIMENT
-# ============================================================
+def figure_sensitivity(sensitivity, base_budget_fraction, output_path):
+    s = sensitivity[
+        np.isclose(sensitivity["budget_fraction"], base_budget_fraction)
+    ].copy()
 
-def main():
+    costs = sorted(s["offer_cost"].unique())
+    success = sorted(s["retention_success"].unique())
+    matrix = np.zeros((len(success), len(costs)))
 
-    warnings.filterwarnings(
-        "ignore"
+    for i, sr in enumerate(success):
+        for j, cost in enumerate(costs):
+            value = s[
+                np.isclose(s["retention_success"], sr)
+                & np.isclose(s["offer_cost"], cost)
+            ]["kgdi_delta_vs_uncertainty"]
+            matrix[i, j] = float(value.iloc[0]) if len(value) else np.nan
+
+    plt.figure(figsize=(7.5, 5.5))
+    im = plt.imshow(matrix, aspect="auto")
+    plt.colorbar(im, label="KGDI net-benefit advantage ($)")
+    plt.xticks(range(len(costs)), [f"${int(x)}" for x in costs])
+    plt.yticks(range(len(success)), [f"{int(100*x)}%" for x in success])
+    plt.xlabel("Retention-offer cost")
+    plt.ylabel("Retention-success assumption")
+    plt.title(
+        f"KGDI Robustness at {int(100*base_budget_fraction)}% Budget Fraction"
     )
 
-    args = parse_args()
+    for i in range(len(success)):
+        for j in range(len(costs)):
+            plt.text(j, i, f"{matrix[i, j]:.0f}", ha="center", va="center")
 
-    output_dir = Path(
-        args.output
-    )
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300)
+    plt.close()
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
 
-    prediction_dir = (
-        output_dir
-        / "predictions"
-    )
-
-    prediction_dir.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    if args.seeds:
-
-        seeds = [
-            int(x.strip())
-            for x
-            in args.seeds.split(",")
-            if x.strip()
-        ]
-
-    elif args.mode == "quick":
-
-        seeds = [42]
-
-    else:
-
-        seeds = [
-            42,
-            52,
-            62,
-            72,
-            82
-        ]
-
-    cfg = BusinessConfig(
-        offer_cost=
-            args.offer_cost,
-
-        retention_success=
-            args.retention_success,
-
-        human_review_cost=
-            args.human_review_cost,
-
-        human_accuracy=
-            args.human_accuracy,
-
-        budget_fraction=
-            args.budget_fraction,
-    )
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "KBS CHURN DECISION INTELLIGENCE"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"Dataset: {args.data}"
-    )
-
-    print(
-        f"Mode: {args.mode}"
-    )
-
-    print(
-        f"Seeds: {seeds}"
-    )
-
-    # --------------------------------------------------------
-    # LOAD AND CLEAN
-    # --------------------------------------------------------
-
-    raw_data = load_data(
-        args.data
-    )
-
-    df, audit = clean_data(
-        raw_data
-    )
-
-    features, numeric, categorical = (
-        select_features(
-            df
-        )
-    )
-
-    audit.update(
-        {
-            "ai_feature_count":
-                len(features),
-
-            "numeric_features":
-                numeric,
-
-            "categorical_features":
-                categorical,
-
-            "ai_features":
-                features,
-
-            "leakage_excluded":
-                LEAKAGE_COLUMNS,
-
-            "business_only":
-                BUSINESS_ONLY_COLUMNS,
-
-            "audit_only":
-                AUDIT_ONLY_COLUMNS,
-        }
-    )
-
-    with open(
-        output_dir
-        / "data_audit.json",
-        "w"
-    ) as file:
-
-        json.dump(
-            audit,
-            file,
-            indent=2
-        )
-
-    print()
-    print(
-        f"Rows: {len(df)}"
-    )
-
-    print(
-        f"Churn rate: "
-        f"{df[TARGET].mean():.4f}"
-    )
-
-    print(
-        f"AI features: "
-        f"{len(features)}"
-    )
-
-    # --------------------------------------------------------
-    # COLUMN ROLE TABLE
-    # --------------------------------------------------------
-
-    role_rows = []
-
-    for column in df.columns:
-
-        if column == TARGET:
+def save_column_roles(df, output_dir):
+    rows = []
+    for c in df.columns:
+        if c == TARGET:
             role = "target"
-
-        elif column in LEAKAGE_COLUMNS:
-            role = "exclude_leakage"
-
-        elif column in BUSINESS_ONLY_COLUMNS:
-            role = "business_decision_layer"
-
-        elif column in AUDIT_ONLY_COLUMNS:
+        elif c in LEAKAGE_COLUMNS:
+            role = "exclude_direct_leakage"
+        elif c in BUSINESS_ONLY_COLUMNS:
+            role = "decision_layer_only"
+        elif c in AUDIT_ONLY_COLUMNS:
             role = "audit_only"
-
-        elif column in ID_GEO_COLUMNS:
-            role = "exclude_identifier_geography"
-
+        elif c in IDENTIFIER_GEO_COLUMNS:
+            role = "exclude_identifier_or_geography"
         else:
             role = "ai_feature"
 
-        role_rows.append(
-            {
-                "column":
-                    column,
+        rows.append({
+            "column": c,
+            "dtype": str(df[c].dtype),
+            "missing": int(df[c].isna().sum()),
+            "unique": int(df[c].nunique(dropna=True)),
+            "role": role,
+        })
 
-                "dtype":
-                    str(
-                        df[column].dtype
-                    ),
+    pd.DataFrame(rows).to_csv(output_dir / "SUPPLEMENT_column_roles.csv", index=False)
 
-                "missing":
-                    int(
-                        df[column]
-                        .isna()
-                        .sum()
-                    ),
 
-                "unique":
-                    int(
-                        df[column]
-                        .nunique(
-                            dropna=True
-                        )
-                    ),
+def main():
+    warnings.filterwarnings("ignore")
+    args = parse_args()
+    validate_args(args)
 
-                "role":
-                    role,
-            }
-        )
+    repeats = args.repeats if args.repeats is not None else (1 if args.mode == "quick" else 5)
+    n_boot = args.bootstrap if args.bootstrap is not None else (200 if args.mode == "quick" else 1000)
 
-    pd.DataFrame(
-        role_rows
-    ).to_csv(
-        output_dir
-        / "column_roles.csv",
-        index=False
+    cfg = BusinessConfig(
+        offer_cost=args.offer_cost,
+        retention_success=args.retention_success,
+        human_review_cost=args.human_review_cost,
+        human_accuracy=args.human_accuracy,
+        budget_fraction=args.budget_fraction,
+        gross_margin_rate=args.gross_margin_rate,
+        value_horizon_months=args.value_horizon_months,
     )
 
-    # --------------------------------------------------------
-    # EXPERIMENT VARIABLES
-    # --------------------------------------------------------
-
-    X = df[
-        features
-    ].copy()
-
-    y = df[
-        TARGET
-    ].astype(int)
-
-    customer_ids = df[
-        "CustomerID"
-    ].astype(str)
-
-    business = df[
-        [
-            "CLTV",
-            "Monthly Charges",
-            "Total Charges",
-            "Tenure Months",
-        ]
-    ].copy()
-
-    model_rows = []
-    decision_rows = []
-
-    tables_for_sensitivity = []
-
-    representative_prediction = None
-
-    # --------------------------------------------------------
-    # MULTI-SEED EXPERIMENT
-    # --------------------------------------------------------
-
-    for seed in seeds:
-
-        print()
-        print(
-            f"SEED {seed}"
-        )
-
-        indices = np.arange(
-            len(df)
-        )
-
-        (
-            train_indices,
-            test_indices
-        ) = train_test_split(
-            indices,
-            test_size=args.test_size,
-            random_state=seed,
-            stratify=y
-        )
-
-        X_train = X.iloc[
-            train_indices
-        ]
-
-        X_test = X.iloc[
-            test_indices
-        ]
-
-        y_train = y.iloc[
-            train_indices
-        ]
-
-        y_test = y.iloc[
-            test_indices
-        ]
-
-        ids_test = customer_ids.iloc[
-            test_indices
-        ]
-
-        business_train = business.iloc[
-            train_indices
-        ]
-
-        business_test = business.iloc[
-            test_indices
-        ]
-
-        high_value_threshold = float(
-            business_train[
-                "CLTV"
-            ].quantile(
-                cfg.high_value_quantile
-            )
-        )
-
-        preprocessor = (
-            create_preprocessor(
-                numeric,
-                categorical
-            )
-        )
-
-        models = create_models(
-            seed,
-            args.mode
-        )
-
-        for (
-            model_name,
-            estimator
-        ) in models.items():
-
-            print(
-                f"Training {model_name}"
-            )
-
-            pipeline = Pipeline(
-                steps=[
-                    (
-                        "preprocessor",
-                        clone(
-                            preprocessor
-                        )
-                    ),
-                    (
-                        "model",
-                        estimator
-                    ),
-                ]
-            )
-
-            # Calibrated probabilities are important
-            # because Decision Intelligence uses
-            # probabilities as risk estimates.
-            calibrated_model = (
-                CalibratedClassifierCV(
-                    estimator=pipeline,
-                    method="sigmoid",
-                    cv=3,
-                    n_jobs=-1
-                )
-            )
-
-            calibrated_model.fit(
-                X_train,
-                y_train
-            )
-
-            probabilities = (
-                calibrated_model
-                .predict_proba(
-                    X_test
-                )[:, 1]
-            )
-
-            uncertainty = (
-                predictive_uncertainty(
-                    probabilities
-                )
-            )
-
-            metrics = model_metrics(
-                y_test.to_numpy(),
-                probabilities
-            )
-
-            model_rows.append(
-                {
-                    "seed":
-                        seed,
-
-                    "model":
-                        model_name,
-
-                    "train_rows":
-                        len(train_indices),
-
-                    "test_rows":
-                        len(test_indices),
-
-                    **metrics,
-                }
-            )
-
-            # ------------------------------------------------
-            # BUILD BUSINESS DECISION TABLE
-            # ------------------------------------------------
-
-            d = pd.DataFrame(
-                {
-                    "CustomerID":
-                        ids_test.values,
-
-                    TARGET:
-                        y_test.values,
-
-                    "churn_probability":
-                        probabilities,
-
-                    "uncertainty":
-                        uncertainty,
-
-                    "CLTV":
-                        business_test[
-                            "CLTV"
-                        ].astype(
-                            float
-                        ).values,
-
-                    "Monthly Charges":
-                        business_test[
-                            "Monthly Charges"
-                        ].values,
-
-                    "Total Charges":
-                        business_test[
-                            "Total Charges"
-                        ].values,
-
-                    "Tenure Months":
-                        business_test[
-                            "Tenure Months"
-                        ].values,
-                }
-            )
-
-            # Same cost-based budget is used
-            # for all strategies.
-            budget = (
-                len(d)
-                * cfg.offer_cost
-                * cfg.budget_fraction
-            )
-
-            strategies = {
-
-                "Probability_Threshold":
-                    threshold_strategy(
-                        d,
-                        cfg,
-                        budget
-                    ),
-
-                "Top_Risk":
-                    top_risk_strategy(
-                        d,
-                        cfg,
-                        budget
-                    ),
-
-                "Cost_Aware":
-                    cost_aware_strategy(
-                        d,
-                        cfg,
-                        budget
-                    ),
-
-                "Proposed_KGDI":
-                    kgdi_strategy(
-                        d,
-                        cfg,
-                        budget,
-                        high_value_threshold
-                    ),
-            }
-
-            for (
-                strategy_name,
-                actions
-            ) in strategies.items():
-
-                evaluation = (
-                    evaluate_decisions(
-                        d,
-                        actions,
-                        cfg
-                    )
-                )
-
-                decision_rows.append(
-                    {
-                        "seed":
-                            seed,
-
-                        "model":
-                            model_name,
-
-                        "strategy":
-                            strategy_name,
-
-                        "budget":
-                            budget,
-
-                        "high_value_threshold":
-                            high_value_threshold,
-
-                        **evaluation,
-                    }
-                )
-
-                d[
-                    f"action_{strategy_name}"
-                ] = actions
-
-            prediction_file = (
-                prediction_dir
-                / (
-                    f"predictions_"
-                    f"seed{seed}_"
-                    f"{model_name}.csv"
-                )
-            )
-
-            d.to_csv(
-                prediction_file,
-                index=False
-            )
-
-            if (
-                representative_prediction
-                is None
-                and model_name
-                == "XGBoost"
-            ):
-
-                representative_prediction = (
-                    prediction_file
-                )
-
-            tables_for_sensitivity.append(
-                (
-                    seed,
-                    model_name,
-                    d[
-                        [
-                            "CustomerID",
-                            TARGET,
-                            "churn_probability",
-                            "uncertainty",
-                            "CLTV",
-                            "Monthly Charges",
-                            "Total Charges",
-                            "Tenure Months",
-                        ]
-                    ].copy(),
-                    high_value_threshold,
-                )
-            )
-
-    # ========================================================
-    # SAVE AI RESULTS
-    # ========================================================
-
-    model_results = pd.DataFrame(
-        model_rows
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 72)
+    print("KBS CHURN DECISION INTELLIGENCE")
+    print("=" * 72)
+    print(f"Mode: {args.mode}")
+    print(f"Outer CV: {args.folds} folds × {repeats} repeats")
+    print(f"Threads/model: {args.threads}")
+    print(f"Paired bootstrap samples: {n_boot}")
+
+    df, audit = clean_data(load_data(args.data))
+    features, numeric, categorical = select_features(df)
+
+    audit.update({
+        "ai_feature_count": len(features),
+        "ai_features": features,
+        "numeric_features": numeric,
+        "categorical_features": categorical,
+        "leakage_excluded": LEAKAGE_COLUMNS,
+        "business_only": BUSINESS_ONLY_COLUMNS,
+        "audit_only": AUDIT_ONLY_COLUMNS,
+    })
+
+    with open(output_dir / "data_audit.json", "w") as f:
+        json.dump(audit, f, indent=2)
+
+    save_column_roles(df, output_dir)
+
+    print(f"Rows: {len(df)} | Churn rate: {df[TARGET].mean():.3f}")
+    print(f"AI predictors: {len(features)}")
+
+    model_metrics, ensemble_by_repeat, _ = run_repeated_oof(
+        df, features, numeric, categorical, args
+    )
+    model_metrics.to_csv(
+        output_dir / "SUPPLEMENT_predictive_metrics_by_repeat.csv", index=False
     )
 
-    model_results.to_csv(
-        output_dir
-        / "model_metrics_all_runs.csv",
-        index=False
+    decision_metrics, decision_tables = run_decision_experiment(
+        df, ensemble_by_repeat, cfg
+    )
+    decision_metrics.to_csv(
+        output_dir / "SUPPLEMENT_decision_metrics_by_repeat.csv", index=False
     )
 
-    model_summary = summarize(
-        model_results,
-        ["model"],
-        [
-            "roc_auc",
-            "pr_auc",
-            "accuracy",
-            "precision",
-            "recall",
-            "f1",
-            "brier",
-            "log_loss",
-            "ece",
-        ]
-    )
-
-    model_summary.to_csv(
-        output_dir
-        / "model_metrics_summary.csv",
-        index=False
-    )
-
-    # ========================================================
-    # SAVE DECISION INTELLIGENCE RESULTS
-    # ========================================================
-
-    decision_results = pd.DataFrame(
-        decision_rows
-    )
-
-    decision_results.to_csv(
-        output_dir
-        / "decision_metrics_all_runs.csv",
-        index=False
-    )
-
-    decision_summary = summarize(
-        decision_results,
-        [
-            "model",
-            "strategy"
-        ],
-        [
-            "intervention_rate",
-            "churn_reach_rate",
-            "high_value_churn_reach_rate",
-            "total_expected_cost",
-            "expected_utility",
-            "outcome_utility_proxy",
-            "unnecessary_offer_cost",
-            "mean_cltv_intervened",
-        ]
-    )
-
-    decision_summary.to_csv(
-        output_dir
-        / "decision_metrics_summary.csv",
-        index=False
-    )
-
-    # ========================================================
-    # STATISTICAL TEST
-    # ========================================================
-
-    significance = statistical_tests(
-        decision_results
-    )
-
+    significance = repeated_significance_tests(decision_metrics)
     significance.to_csv(
-        output_dir
-        / "decision_significance_tests.csv",
-        index=False
+        output_dir / "SUPPLEMENT_repeated_cv_significance.csv", index=False
     )
 
-    # ========================================================
-    # PAPER-MODE SENSITIVITY ANALYSIS
-    # ========================================================
+    # Aggregate repeated OOF ensemble predictions for the final descriptive policy.
+    stacked_p = np.vstack([
+        ensemble_by_repeat[r]["probability"] for r in sorted(ensemble_by_repeat)
+    ])
+    stacked_u = np.vstack([
+        ensemble_by_repeat[r]["uncertainty"] for r in sorted(ensemble_by_repeat)
+    ])
+    stacked_entropy = np.vstack([
+        ensemble_by_repeat[r]["entropy"] for r in sorted(ensemble_by_repeat)
+    ])
+    stacked_dis = np.vstack([
+        ensemble_by_repeat[r]["disagreement"] for r in sorted(ensemble_by_repeat)
+    ])
 
-    if args.mode == "paper":
+    final_info = {
+        "probability": stacked_p.mean(axis=0),
+        "uncertainty": stacked_u.mean(axis=0),
+        "entropy": stacked_entropy.mean(axis=0),
+        "disagreement": stacked_dis.mean(axis=0),
+    }
+    final_d = build_decision_table(df, final_info, cfg)
+    budget = len(final_d) * cfg.offer_cost * cfg.budget_fraction
 
-        print()
-        print(
-            "Running sensitivity analysis"
-        )
+    final_uncertainty = policy_uncertainty_review(final_d, cfg, budget)
+    final_kgdi = policy_kgdi(final_d, cfg, budget)
 
-        sensitivity = (
-            sensitivity_analysis(
-                tables_for_sensitivity,
-                cfg
-            )
-        )
+    bootstrap_result = bootstrap_delta(
+        final_d, final_kgdi, final_uncertainty, cfg, n_boot, args.seed + 909
+    )
+    with open(output_dir / "SUPPLEMENT_bootstrap_KGDI_vs_uncertainty.json", "w") as f:
+        json.dump(bootstrap_result, f, indent=2)
 
-        sensitivity.to_csv(
-            output_dir
-            / "sensitivity_analysis.csv",
-            index=False
-        )
+    ablations = run_ablations(final_d, cfg)
+    ablations.to_csv(output_dir / "SUPPLEMENT_ablation_study.csv", index=False)
 
-        sensitivity_summary = summarize(
-            sensitivity,
-            [
-                "strategy",
-                "offer_cost",
-                "retention_success",
-                "budget_fraction",
-            ],
-            [
-                "outcome_utility_proxy",
-                "churn_reach_rate",
-                "unnecessary_offer_cost",
-            ]
-        )
+    audit_groups = subgroup_audit(df, final_d, final_kgdi)
+    audit_groups.to_csv(output_dir / "SUPPLEMENT_subgroup_audit.csv", index=False)
 
-        sensitivity_summary.to_csv(
-            output_dir
-            / "sensitivity_summary.csv",
-            index=False
-        )
+    sensitivity = sensitivity_analysis(final_d, cfg)
+    sensitivity.to_csv(output_dir / "SUPPLEMENT_sensitivity.csv", index=False)
 
-    # ========================================================
-    # CREATE FIGURES
-    # ========================================================
+    table1 = make_table_1(model_metrics)
+    table2 = make_table_2(decision_metrics, bootstrap_result)
+    table1.to_csv(output_dir / "TABLE_1_predictive_performance.csv", index=False)
+    table2.to_csv(output_dir / "TABLE_2_decision_performance.csv", index=False)
 
-    create_figures(
-        model_summary,
-        decision_summary,
-        representative_prediction,
-        output_dir
+    figure_decision_map(
+        final_d,
+        final_kgdi,
+        output_dir / "FIGURE_1_KGDI_decision_map.png",
+    )
+    figure_sensitivity(
+        sensitivity,
+        cfg.budget_fraction,
+        output_dir / "FIGURE_2_KGDI_sensitivity.png",
     )
 
-    # ========================================================
-    # SAVE REPRODUCIBILITY CONFIGURATION
-    # ========================================================
+    final_predictions = final_d.copy()
+    final_predictions["action_Uncertainty_Review"] = final_uncertainty
+    final_predictions["action_Proposed_KGDI"] = final_kgdi
+    final_predictions.to_csv(
+        output_dir / "SUPPLEMENT_customer_level_oof_decisions.csv", index=False
+    )
 
     run_config = {
-
-        "title":
-            (
-                "Knowledge-Guided Decision "
-                "Intelligence for Cost-Aware "
-                "Customer Churn Intervention "
-                "Under Predictive Uncertainty"
-            ),
-
-        "dataset":
-            args.data,
-
-        "mode":
-            args.mode,
-
-        "seeds":
-            seeds,
-
-        "test_size":
-            args.test_size,
-
-        "business_parameters":
-            asdict(cfg),
-
-        "methodological_disclosure":
-            (
-                "IBM customer characteristics, "
-                "churn outcomes, service variables "
-                "and CLTV are dataset variables. "
-                "Retention cost, retention success, "
-                "human review cost/accuracy, budget "
-                "and uncertainty penalty are "
-                "simulation assumptions."
-            ),
-
-        "python":
-            sys.version,
-
-        "platform":
-            platform.platform(),
-
-        "pandas":
-            pd.__version__,
-
-        "numpy":
-            np.__version__,
+        "study_title": (
+            "Knowledge-Guided Decision Intelligence for Cost-Aware Customer "
+            "Churn Intervention Under Predictive Uncertainty"
+        ),
+        "data_path": str(args.data),
+        "mode": args.mode,
+        "folds": args.folds,
+        "repeats": repeats,
+        "seed": args.seed,
+        "bootstrap_samples": n_boot,
+        "threads": args.threads,
+        "business_parameters": asdict(cfg),
+        "business_value_definition": (
+            "12-month revenue-at-risk proxy = Monthly Charges × horizon months × "
+            "gross-margin rate. CLTV is used only as a dimensionless priority index."
+        ),
+        "uncertainty_definition": (
+            "0.70 × binary predictive entropy + 0.30 × normalized disagreement "
+            "across calibrated AI models."
+        ),
+        "methodological_disclosure": (
+            "IBM customer variables and churn outcomes are observed dataset fields. "
+            "Retention cost, intervention success, human-review cost/accuracy, "
+            "gross-margin rate, horizon, and budget are simulated assumptions."
+        ),
+        "python": sys.version,
+        "platform": platform.platform(),
+        "pandas": pd.__version__,
+        "numpy": np.__version__,
     }
+    with open(output_dir / "run_config.json", "w") as f:
+        json.dump(run_config, f, indent=2)
 
-    with open(
-        output_dir
-        / "run_config.json",
-        "w"
-    ) as file:
-
-        json.dump(
-            run_config,
-            file,
-            indent=2
-        )
-
-    # ========================================================
-    # TERMINAL SUMMARY
-    # ========================================================
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "EXPERIMENT COMPLETE"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    print(
-        f"Results saved to: "
-        f"{output_dir.resolve()}"
-    )
-
-    print()
-    print(
-        "AI MODEL SUMMARY"
-    )
-
-    print(
-        model_summary.to_string(
-            index=False
-        )
-    )
-
-    print()
-    print(
-        "DECISION INTELLIGENCE SUMMARY"
-    )
-
-    print(
-        decision_summary.to_string(
-            index=False
-        )
-    )
-
-    if not significance.empty:
-
-        print()
-        print(
-            "STATISTICAL COMPARISONS"
-        )
-
-        print(
-            significance.to_string(
-                index=False
-            )
-        )
+    print("\nPRIMARY TABLE 1")
+    print(table1.to_string(index=False))
+    print("\nPRIMARY TABLE 2")
+    print(table2.to_string(index=False))
+    print("\nBOOTSTRAP KGDI vs UNCERTAINTY REVIEW")
+    print(json.dumps(bootstrap_result, indent=2))
+    print(f"\nResults saved to: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":

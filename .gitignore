@@ -2,6 +2,7 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
 
 # Do not publish IBM dataset
@@ -11,3 +12,7 @@ data/*
 # Generated results
 results/*
 !results/.gitkeep
+
+# Definitive local experiment archives / bundles
+KGDI_paper_final_*.tar.gz
+KGDI_paper_final_*.zip

@@ -1,0 +1,5 @@
+Strategy,Intervention %,Churn reach %,High-value churn reach %,Offers / reviews,Net-benefit proxy ($),Δ vs cost-aware ($),95% CI (net benefit),P(Δ>0) net benefit,Δ high-value reach (pp),P(Δ>0) high-value reach
+Probability threshold,20.0,51.7,43.0,1408 / 0,53786,,,,,
+Cost-aware,20.0,49.9,43.8,1408 / 0,65209,,,,,
+Uncertainty review,24.5,56.4,54.2,79 / 1650,59253,,,,,
+Proposed KGDI,20.8,50.6,56.4,1297 / 166,67529,2320,"[-92, 5397]",0.968,12.6,1.000

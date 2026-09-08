@@ -198,8 +198,17 @@ def planning_budget(d, cfg) -> float:
     return float(len(d) * cfg.offer_cost * cfg.budget_fraction)
 
 
-def policy_kgdi_c(d, cfg, budget, economic_share: float):
-    """Majority cost-aware offers, minority knowledge-guided high-value review."""
+def policy_kgdi_c(
+    d,
+    cfg,
+    budget,
+    economic_share: float,
+    *,
+    use_cltv: bool = True,
+    use_entropy: bool = True,
+    use_graph: bool = True,
+):
+    """Majority cost-aware offers, minority high-value review with optional gates."""
     if not (0.0 <= economic_share <= 1.0):
         raise ValueError("economic_share must be in [0, 1]")
     v = kgdi.business_vectors(d, cfg)
@@ -221,15 +230,24 @@ def policy_kgdi_c(d, cfg, budget, economic_share: float):
             actions[i] = "Retention Offer"
             spent += cfg.offer_cost
 
+    cltv_ok = (
+        v["cltv_pct"] >= cfg.high_value_quantile
+        if use_cltv
+        else np.ones(n, dtype=bool)
+    )
+    signal = np.zeros(n, dtype=bool)
+    if use_entropy:
+        signal |= v["uncertainty"] >= cfg.moderate_uncertainty_threshold
+    if use_graph:
+        signal |= knowledge_residual > 0
+    if not use_entropy and not use_graph:
+        signal = np.ones(n, dtype=bool)
     review_ok = (
         (actions == "No Action")
         & (v["p"] >= cfg.minimum_churn_risk)
-        & (v["cltv_pct"] >= cfg.high_value_quantile)
+        & cltv_ok
         & (v["review_utility"] > 0)
-        & (
-            (v["uncertainty"] >= cfg.moderate_uncertainty_threshold)
-            | (knowledge_residual > 0)
-        )
+        & signal
     )
     review_priority = v["review_utility"] / np.maximum(v["review_expected_cost"], 1e-12)
     for i in np.argsort(-review_priority):
@@ -308,13 +326,22 @@ def run_share_grid(d, cfg, budget, shares) -> pd.DataFrame:
 
 def ablations(d, cfg, budget, economic_share: float) -> pd.DataFrame:
     variants = {
-        "KGDI_C_full": policy_kgdi_c(d, cfg, budget, economic_share),
-        "No_review_reserve": policy_kgdi_c(d, cfg, budget, 1.0),
-        "No_knowledge_residual": policy_kgdi_c(
-            d.assign(knowledge_residual=0.0), cfg, budget, economic_share
+        "Cost_aware": kgdi.policy_cost_aware(d, cfg, budget),
+        "CLTV_only": policy_kgdi_c(
+            d, cfg, budget, economic_share, use_cltv=True, use_entropy=False, use_graph=False
         ),
+        "CLTV_entropy": policy_kgdi_c(
+            d, cfg, budget, economic_share, use_cltv=True, use_entropy=True, use_graph=False
+        ),
+        "CLTV_graph": policy_kgdi_c(
+            d, cfg, budget, economic_share, use_cltv=True, use_entropy=False, use_graph=True
+        ),
+        "Full_KGDI": policy_kgdi_c(
+            d, cfg, budget, economic_share, use_cltv=True, use_entropy=True, use_graph=True
+        ),
+        "No_review_reserve": policy_kgdi_c(d, cfg, budget, 1.0),
         "No_CLTV_gate": policy_kgdi_c(
-            d.assign(cltv_percentile=1.0), cfg, budget, economic_share
+            d, cfg, budget, economic_share, use_cltv=False, use_entropy=True, use_graph=True
         ),
     }
     rows = []

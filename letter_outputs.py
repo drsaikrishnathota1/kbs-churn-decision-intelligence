@@ -241,6 +241,9 @@ def main():
     table1.to_csv(out / "TABLE_1_predictive_performance.csv", index=False)
     t2 = table_2(letter_rows, boot)
     t2.to_csv(out / "TABLE_2_decision_performance.csv", index=False)
+    xc.ablations(d, cfg, budget, args.economic_share).to_csv(
+        out / "SUPPLEMENT_component_ablation.csv", index=False
+    )
 
     figure_1(d, proposed, out / "FIGURE_1_decision_map.png")
     figure_2(share_grid, letter_rows, out / "FIGURE_2_tradeoff.png")

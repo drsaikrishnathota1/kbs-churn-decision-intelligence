@@ -9,6 +9,9 @@ Research code for:
 - `main.py` — frozen Experiment A predictive + decision-intelligence pipeline.
 - `runpod_runner.py` — integrity/reproducibility wrapper for Experiment A.
 - `experiment_b.py` — locked post-primary Experiment B multi-objective MILP analysis.
+- `experiment_c.py` — knowledge-gated decision layer on frozen Experiment A OOF (no refit).
+- `letter_outputs.py` — camera-ready Tables 1–2 and Figs. 1–2 from frozen OOF.
+- `review_analyses.py` — component ablation, residual bins, disagreement overlap, scenario sensitivity.
 - `EXPERIMENT_B_PROTOCOL.md` — frozen Experiment B protocol and reporting rules.
 - `requirements.txt` — portable minimum dependency versions.
 - `requirements-runpod.txt` — exact top-level package versions used by the definitive Experiment A RunPod environment and required for the definitive Experiment B run.

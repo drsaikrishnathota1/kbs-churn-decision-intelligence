@@ -10,11 +10,11 @@ Files in this folder
 - KBS_short_communication.md — manuscript source (paste into Word, single column, double line spacing)
 - highlights.txt — upload separately; filename must contain “highlights”
 - Figure_1.png / Figure_1.pdf — decision map (also keep PNG ≥300 dpi)
-- Figure_2.png / Figure_2.pdf — economic–strategic tradeoff
+- Figure_2.png / Figure_2.pdf — epsilon-constraint efficiency frontier (utility retained vs strategic-risk mass)
 - TABLE_1_predictive_performance.csv / TABLE_2_decision_performance.csv — numeric originals; tables in the manuscript must remain editable text, not screenshots
 
 Before upload
-1. Confirm the title-page author line: Dr. Sai Krishna Thota, PhD; affiliation Independent Researcher, USA.
+1. Confirm the title-page author line: Dr. Sai Krishna Thota, PhD; Independent Researcher, United States; corresponding e-mail drsaikrishnathota@ieee.org.
 2. Paste the markdown into Word: single column, double line spacing, numbered sections unchanged.
 3. Confirm abstract ≤250 words and contains no citations (Guide for Authors).
 4. Confirm each highlight ≤85 characters including spaces (already checked).

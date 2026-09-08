@@ -1,5 +1,5 @@
 High-value churn reach is the primary budgeted decision endpoint.
-CLTV review reserve lifts high-value reach 12.6 pp (1000/1000).
-Graph residual does not change the 0.85 allocation versus CLTV-only.
-Net-benefit +$2320; 968/1000; 95% CI includes -$92.
-85/15 is a nominal minority-review point, not a unique optimum.
+85/15 review reserve lifts high-value reach 12.6 pp (1000/1000).
+CLTV offer-only reservation does not explain the coverage gain.
+Net-benefit +$2320; 95% CI includes a small negative value.
+Exact endpoint retains 99.68% utility vs 93.02% for 85/15.

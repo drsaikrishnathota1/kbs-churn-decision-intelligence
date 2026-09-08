@@ -1,0 +1,18 @@
+Dear Editor,
+
+Please consider this short communication for Knowledge-Based Systems:
+
+Knowledge-Guided Decision Intelligence for Strategic-Value-Aware Customer Churn Intervention Under Budget Constraints
+
+The letter treats strategic customer-value coverage and economic utility as non-identical objectives under a shared intervention budget. A leakage-safe calibrated ensemble supplies risk; customer lifetime value supplies strategic-value knowledge; a minority human-review reserve is compared with a matched CLTV-reserved offer-only policy; and an exact epsilon-constraint programme quantifies the efficiency cost of the operational 85/15 heuristic. The primary result is a 12.6 percentage-point gain in high-value churn reach versus cost-aware targeting. Dollar superiority is not claimed.
+
+The manuscript contains two tables and two figures. Code is at https://github.com/drsaikrishnathota1/kbs-churn-decision-intelligence.
+
+Corresponding author: Dr. Sai Krishna Thota, PhD
+Independent Researcher, United States
+E-mail: drsaikrishnathota@ieee.org
+
+Thank you for your consideration.
+
+Sincerely,
+Dr. Sai Krishna Thota, PhD

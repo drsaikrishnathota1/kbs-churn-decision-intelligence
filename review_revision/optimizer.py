@@ -67,8 +67,10 @@ def build_candidates(
                 "expected_cost": float(cfg.offer_cost),
             })
         if (not offer_only and entropy[i] >= cfg.review_entropy_threshold and review_u[i] > 0):
+            # Expected identified-risk engagement differs from mere review assignment.
+            # Sensitivity applies only to the true-churn component of the reviewed population.
             rows.append({
-                **common, "action": "Human Review",
+                **common, "strategic_mass": float(p[i] * q[i] * (reviewer_override[0] if reviewer_override is not None else cfg.human_sensitivity)), "action": "Human Review",
                 "expected_utility": float(review_u[i]),
                 "expected_cost": float(review_cost[i]),
             })
@@ -116,6 +118,17 @@ def solve(candidates, n_customers, budget, objective, min_strategic=0.0, max_rev
     if not res.success or res.x is None:
         raise RuntimeError(f"MILP failed: status={res.status}, message={res.message}")
     chosen = res.x > 0.5
+    if not np.all(np.isfinite(res.x)) or np.max(np.abs(res.x - chosen.astype(float))) > 1e-5:
+        raise RuntimeError("MILP returned non-integral or non-finite selection")
+    selected_tmp = candidates.loc[chosen]
+    if selected_tmp["expected_cost"].sum() > budget + 1e-7 * max(1, budget):
+        raise RuntimeError("MILP returned over-budget solution")
+    if selected_tmp["row_index"].duplicated().any():
+        raise RuntimeError("MILP returned multiple actions per customer")
+    if min_strategic > 0 and selected_tmp["strategic_mass"].sum() + 1e-7 * max(1, min_strategic) < min_strategic:
+        raise RuntimeError("MILP returned strategic-infeasible solution")
+    if max_reviews is not None and (selected_tmp["action"] == "Human Review").sum() > max_reviews:
+        raise RuntimeError("MILP exceeded review capacity")
     selected = candidates.loc[chosen].copy()
     return selected
 
@@ -139,14 +152,21 @@ def evaluate(scores, selected, cfg: RevisionScenario, budget, smax):
     high = q >= 0.75
     churn = y == 1
     acted = actions != "No Action"
+    # Assignment coverage is operational workload, not equivalent to effective engagement.
+    # Effective figures are assumptions-based, NOT actual retention/causal uplift.
+    effective = np.where(actions == "Retention Offer", 1.0,
+                         np.where(actions == "Human Review", cfg.human_sensitivity, 0.0))
     hv_den = int(np.sum(high & churn))
     ch_den = int(np.sum(churn))
     return {
         "expected_utility": utility,
         "strategic_risk_mass": strategic,
+        "metric_definition": "review assignment is distinct from sensitivity-adjusted identification; not causal retained customers",
         "strategic_fraction_of_smax": strategic / smax if smax > 0 else np.nan,
         "high_value_churn_reach": float(np.sum(acted & high & churn) / hv_den) if hv_den else np.nan,
         "churn_reach": float(np.sum(acted & churn) / ch_den) if ch_den else np.nan,
+        "effective_high_value_churn_reach": float(np.sum(effective * (high & churn)) / hv_den) if hv_den else np.nan,
+        "effective_churn_reach": float(np.sum(effective * churn) / ch_den) if ch_den else np.nan,
         "offers": int(np.sum(actions == "Retention Offer")),
         "reviews": int(np.sum(actions == "Human Review")),
         "budget_used": spent,
@@ -179,6 +199,8 @@ def frontier(scores: pd.DataFrame, cfg: RevisionScenario):
             "strategic_fraction_of_smax": m["strategic_fraction_of_smax"],
             "high_value_churn_reach": m["high_value_churn_reach"],
             "churn_reach": m["churn_reach"],
+            "effective_high_value_churn_reach": m["effective_high_value_churn_reach"],
+            "effective_churn_reach": m["effective_churn_reach"],
             "offers": m["offers"],
             "reviews": m["reviews"],
             "budget_used": m["budget_used"],
@@ -251,6 +273,16 @@ def knowledge_ablation(scores: pd.DataFrame, cfg: RevisionScenario):
         sel, budget, smax = _midpoint_selected(scores, cfg, **kw)
         ev = evaluate(scores, sel, cfg, budget, smax)
         actions = ev.pop("actions")
+        # Common-reference evaluation: do NOT interpret the ablated selection
+        # objective as comparable realized economic utility.
+        u_ref_offer, u_ref_review, c_ref_review = utilities(scores, cfg)
+        ref_utility = float(np.sum(np.where(actions == "Retention Offer", u_ref_offer,
+                              np.where(actions == "Human Review", u_ref_review, 0.0))))
+        ref_cost = float(np.sum(np.where(actions == "Retention Offer", cfg.offer_cost,
+                           np.where(actions == "Human Review", c_ref_review, 0.0))))
+        ev["reference_expected_utility"] = ref_utility
+        ev["reference_expected_cost"] = ref_cost
+        ev["reference_budget_feasible"] = bool(ref_cost <= budget + 1e-8)
         rows.append({
             "variant": name,
             "different_actions_vs_full": int(np.sum(actions != full_actions)),

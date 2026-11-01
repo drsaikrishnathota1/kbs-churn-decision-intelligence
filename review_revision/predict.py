@@ -108,6 +108,16 @@ def fit_calibrated(model, preprocessor, X_train, y_train, X_test, seed):
 
 
 def run_oof(X: pd.DataFrame, y: pd.Series, folds=5, repeats=3, seed=20261031, threads=8):
+    if folds < 2 or repeats < 1:
+        raise ValueError("folds must be >=2 and repeats >=1")
+    if len(X) != len(y) or len(X) == 0:
+        raise ValueError("X/y empty or inconsistent")
+    if X.columns.duplicated().any():
+        raise ValueError("Duplicate predictive feature columns")
+    if pd.Series(y).isna().any() or not set(pd.Series(y).unique()).issubset({0, 1}):
+        raise ValueError("Target must be nonmissing binary")
+    if int(pd.Series(y).value_counts().min()) < folds:
+        raise ValueError("Each class must contain at least folds examples")
     X = X.reset_index(drop=True)
     y = y.astype(int).reset_index(drop=True)
     numeric, categorical = infer_types(X)

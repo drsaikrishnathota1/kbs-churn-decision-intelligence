@@ -134,6 +134,11 @@ def main():
         },
         "quick_development_run": bool(args.quick),
     })
+    if args.quick:
+        (out / "NOT_FOR_PUBLICATION_QUICK_RUN.txt").write_text(
+            "DEVELOPMENT-ONLY: reduced folds, repeats, epsilon grid and bootstrap. Do not cite these results.\n",
+            encoding="utf-8",
+        )
     print(f"Revision outputs written to {out}")
     return 0
 

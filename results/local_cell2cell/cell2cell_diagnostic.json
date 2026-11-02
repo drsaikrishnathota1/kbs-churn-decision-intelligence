@@ -1,0 +1,38 @@
+[
+  {
+    "variant": "Full economic",
+    "status": 0,
+    "message": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+    "solver_gap": 0.00010147580503274321,
+    "seconds": 18.08,
+    "has_solution": true,
+    "selected_actions": 11254,
+    "expected_utility": 556.1818646628494,
+    "strategic_mass_under_variant": 2498.501961050686,
+    "budget_used": 508.86502124901705
+  },
+  {
+    "variant": "Full strategic",
+    "status": 0,
+    "message": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+    "solver_gap": 4.553712012419872e-05,
+    "seconds": 29.96,
+    "has_solution": true,
+    "selected_actions": 11261,
+    "expected_utility": 440.36410147409583,
+    "strategic_mass_under_variant": 2899.536364138799,
+    "budget_used": 508.8780357959338
+  },
+  {
+    "variant": "No strategic knowledge",
+    "status": 0,
+    "message": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+    "solver_gap": 8.22977219031044e-05,
+    "seconds": 16.97,
+    "has_solution": true,
+    "selected_actions": 11079,
+    "expected_utility": 422.2017960376165,
+    "strategic_mass_under_variant": 4134.256557634579,
+    "budget_used": 508.86963300902505
+  }
+]

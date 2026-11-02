@@ -1,0 +1,51 @@
+{
+  "seed": 20261031,
+  "bootstrap_samples": 1000,
+  "reference": "Cost_Aware",
+  "comparisons": {
+    "Fixed_Cost_Benefit_Matrix": {
+      "observed": {
+        "delta_hv": -0.07123287671232875,
+        "delta_churn": -0.06474050294275013,
+        "delta_nb": -12808.736000000004
+      },
+      "hv": {
+        "ci_2_5": -0.11239806663077553,
+        "ci_97_5": -0.03296477495107632,
+        "fraction_positive": 0.0
+      },
+      "churn": {
+        "ci_2_5": -0.0807947243476861,
+        "ci_97_5": -0.039388691797473736,
+        "fraction_positive": 0.0
+      },
+      "nb": {
+        "ci_2_5": -17703.355300000007,
+        "ci_97_5": -7781.656649999989,
+        "fraction_positive": 0.0
+      }
+    },
+    "p_x_CLTV_Percentile": {
+      "observed": {
+        "delta_hv": 0.002739726027397249,
+        "delta_churn": 0.0,
+        "delta_nb": 22.553999999989173
+      },
+      "hv": {
+        "ci_2_5": 0.0,
+        "ci_97_5": 0.01690990772219521,
+        "fraction_positive": 0.519
+      },
+      "churn": {
+        "ci_2_5": -0.009497099579413611,
+        "ci_97_5": 0.0020475320603091066,
+        "fraction_positive": 0.14
+      },
+      "nb": {
+        "ci_2_5": -4171.626900000005,
+        "ci_97_5": 713.969550000008,
+        "fraction_positive": 0.156
+      }
+    }
+  }
+}

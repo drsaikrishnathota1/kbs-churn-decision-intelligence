@@ -115,7 +115,12 @@ for dataset in ["ibm_telco", "iranian_churn"]:
         matches = [r for r in subset if r["epsilon"] == eps]
         if len(matches) == 2:
             a, b = matches
-            diff = len(set(a["selected_rows"]) ^ set(b["selected_rows"]))
+            actions_a = dict(a["selected_rows"])
+            actions_b = dict(b["selected_rows"])
+            diff = sum(
+                actions_a.get(i, "No Action") != actions_b.get(i, "No Action")
+                for i in set(actions_a) | set(actions_b)
+            )
             for r in matches:
                 r["selection_difference_symmetric"] = diff
 

@@ -62,7 +62,7 @@ def run_dataset(bundle, out, cfg, threads, predictive=True):
 
     metrics.to_csv(out / "predictive_metrics.csv", index=False)
     scores.to_csv(out / "customer_scores.csv", index=False)
-    f, meta = frontier(scores, cfg)
+    f, meta = frontier(scores, cfg, checkpoint_dir=out)
     f.to_csv(out / "epsilon_frontier.csv", index=False)
     op = operating_points(f)
     op.to_csv(out / "operating_points.csv", index=False)

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import replace, asdict
+import hashlib
+import json
+import os
+import platform
+import sys
+from pathlib import Path
+import scipy
+# KBS_CHECKPOINT_PATCH_V1
 import numpy as np
 import pandas as pd
 from scipy.optimize import Bounds, LinearConstraint, milp
@@ -108,12 +116,19 @@ def solve(candidates, n_customers, budget, objective, min_strategic=0.0, max_rev
         c = -candidates["strategic_mass"].to_numpy(float)
     else:
         raise ValueError(objective)
+    options = {"presolve": True, "mip_rel_gap": 1e-7, "disp": False}
+    raw_limit = os.environ.get("KBS_MIP_TIME_LIMIT_S", "").strip()
+    if raw_limit:
+        max_seconds = float(raw_limit)
+        if not np.isfinite(max_seconds) or max_seconds <= 0:
+            raise ValueError("KBS_MIP_TIME_LIMIT_S must be a positive finite number")
+        options["time_limit"] = max_seconds
     res = milp(
         c=c,
         integrality=np.ones(len(candidates), dtype=int),
         bounds=Bounds(np.zeros(len(candidates)), np.ones(len(candidates))),
         constraints=_constraints(candidates, n_customers, budget, min_strategic, max_reviews),
-        options={"presolve": True, "mip_rel_gap": 1e-7, "disp": False},
+        options=options,
     )
     if not res.success or res.x is None:
         raise RuntimeError(f"MILP failed: status={res.status}, message={res.message}")
@@ -175,7 +190,40 @@ def evaluate(scores, selected, cfg: RevisionScenario, budget, smax):
     }
 
 
-def frontier(scores: pd.DataFrame, cfg: RevisionScenario):
+def frontier(scores: pd.DataFrame, cfg: RevisionScenario, checkpoint_dir=None):
+    """Compute frontier; optionally save/reuse only successfully validated epsilon points.
+
+    Checkpoints are fingerprinted by full score content, scenario and optimizer source.
+    Endpoint solves are repeated on restart for independent feasibility verification.
+    """
+    checkpoint_path = Path(checkpoint_dir) / "frontier_checkpoint.json" if checkpoint_dir else None
+    ckpt = None
+    saved_rows = {}
+    if checkpoint_path is not None:
+        score_fingerprint = hashlib.sha256(
+            pd.util.hash_pandas_object(scores, index=True).to_numpy().tobytes()
+        ).hexdigest()
+        source_fingerprint = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        identity = {
+            "schema": 1,
+            "scores_hash": score_fingerprint,
+            "optimizer_hash": source_fingerprint,
+            "runtime": {"python": sys.version, "platform": platform.platform(), "scipy": scipy.__version__},
+            "scenario": asdict(cfg),
+            "customers": len(scores),
+        }
+        if checkpoint_path.is_file():
+            ckpt = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+            if ckpt.get("identity") != identity:
+                raise RuntimeError(
+                    f"Checkpoint identity mismatch at {checkpoint_path}. "
+                    "Use a fresh output directory after changing scores, solver or scenario."
+                )
+            saved_rows = ckpt.get("rows", {})
+            if not isinstance(saved_rows, dict):
+                raise RuntimeError("Malformed frontier checkpoint rows")
+        else:
+            ckpt = {"identity": identity, "rows": {}}
     n = len(scores)
     budget = n * cfg.offer_cost * cfg.budget_fraction
     max_reviews = int(np.floor(cfg.review_capacity_fraction * n))
@@ -184,14 +232,26 @@ def frontier(scores: pd.DataFrame, cfg: RevisionScenario):
     strategic = solve(cand, n, budget, "strategic", max_reviews=max_reviews)
     smax = float(strategic["strategic_mass"].sum())
     u0 = float(econ["expected_utility"].sum())
+    if ckpt is not None:
+        endpoints = {"smax": smax, "u0": u0, "budget": budget, "max_reviews": max_reviews}
+        if "endpoints" in ckpt and ckpt["endpoints"] != endpoints:
+            raise RuntimeError("Recomputed frontier endpoints do not match the checkpoint; use a fresh output directory")
+        ckpt["endpoints"] = endpoints
     rows = []
     eps_values = np.round(np.arange(0, 1.0000001, cfg.epsilon_step), 10)
     for eps in eps_values:
+        eps_key = f"{float(eps):.8f}"
+        if eps_key in saved_rows:
+            row = saved_rows[eps_key]
+            if not isinstance(row, dict) or float(row.get("epsilon", -1)) != float(eps):
+                raise RuntimeError(f"Malformed checkpoint point at epsilon={eps}")
+            rows.append(row)
+            continue
         sel = solve(
             cand, n, budget, "utility", min_strategic=float(eps * smax), max_reviews=max_reviews
         )
         m = evaluate(scores, sel, cfg, budget, smax)
-        rows.append({
+        row = {
             "epsilon": float(eps),
             "expected_utility": m["expected_utility"],
             "utility_retained": m["expected_utility"] / u0 if u0 else np.nan,
@@ -205,8 +265,19 @@ def frontier(scores: pd.DataFrame, cfg: RevisionScenario):
             "reviews": m["reviews"],
             "budget_used": m["budget_used"],
             "budget_utilization": m["budget_utilization"],
-        })
-    return pd.DataFrame(rows), {"budget": budget, "max_reviews": max_reviews, "smax": smax, "u0": u0}
+        }
+        rows.append(row)
+        if checkpoint_path is not None:
+            ckpt["rows"][eps_key] = row
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = checkpoint_path.with_suffix(".json.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(ckpt, f, indent=2, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, checkpoint_path)
+            print(f"[checkpoint] epsilon={float(eps):.2f} saved to {checkpoint_path}", flush=True)
+    return pd.DataFrame(rows, columns=['epsilon', 'expected_utility', 'utility_retained', 'strategic_risk_mass', 'strategic_fraction_of_smax', 'high_value_churn_reach', 'churn_reach', 'effective_high_value_churn_reach', 'effective_churn_reach', 'offers', 'reviews', 'budget_used', 'budget_utilization']), {"budget": budget, "max_reviews": max_reviews, "smax": smax, "u0": u0}
 
 
 def operating_points(frontier_df: pd.DataFrame):
